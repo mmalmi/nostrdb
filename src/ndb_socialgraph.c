@@ -1,4 +1,5 @@
 #include "ndb_socialgraph.h"
+#include "bucketed_u32_list.h"
 #include "nostrdb.h"
 #include "hex.h"
 #include "lmdb.h"
@@ -6,58 +7,207 @@
 #include <string.h>
 #include <stdio.h>
 
-// Helper to pack/unpack UID arrays for storage
-// Format: 4-byte count + array of UIDs
-struct uid_list {
-	uint32_t count;
-	ndb_uid_t uids[];
+// Composite key for users_by_follow_distance: (distance, uid)
+struct distance_uid_key {
+	uint32_t distance;
+	ndb_uid_t uid;
 };
 
-static int uid_list_contains(struct uid_list *list, ndb_uid_t uid)
+// Composite key for followers_by_followed: (followed_uid, follower_uid)
+struct follower_key {
+	ndb_uid_t followed_uid;
+	ndb_uid_t follower_uid;
+};
+
+// Composite key for muters_by_muted: (muted_uid, muter_uid)
+struct muter_key {
+	ndb_uid_t muted_uid;
+	ndb_uid_t muter_uid;
+};
+
+// Helper: update distance in both follow_distance and users_by_follow_distance
+// Pass old_distance = UINT32_MAX if user had no prior distance
+static int update_follow_distance(void *txn, struct ndb_socialgraph *graph,
+                                   ndb_uid_t uid, uint32_t old_distance, uint32_t new_distance)
 {
-	for (uint32_t i = 0; i < list->count; i++) {
-		if (list->uids[i] == uid)
-			return 1;
-	}
-	return 0;
-}
+	MDB_dbi distance_dbi = (MDB_dbi)(intptr_t)graph->follow_distance_db;
+	MDB_dbi distance_idx_dbi = (MDB_dbi)(intptr_t)graph->users_by_follow_distance_db;
+	MDB_val key, val;
+	int rc;
 
-static struct uid_list *uid_list_create(uint32_t capacity)
-{
-	size_t size = sizeof(struct uid_list) + capacity * sizeof(ndb_uid_t);
-	struct uid_list *list = malloc(size);
-	if (list)
-		list->count = 0;
-	return list;
-}
-
-static int uid_list_add(struct uid_list **list_ptr, uint32_t *capacity, ndb_uid_t uid)
-{
-	struct uid_list *list = *list_ptr;
-
-	// Check if already exists
-	if (uid_list_contains(list, uid))
-		return 1;
-
-	// Resize if needed
-	if (list->count >= *capacity) {
-		uint32_t new_capacity = *capacity * 2;
-		size_t new_size = sizeof(struct uid_list) + new_capacity * sizeof(ndb_uid_t);
-		struct uid_list *new_list = realloc(list, new_size);
-		if (!new_list)
-			return 0;
-		*list_ptr = new_list;
-		*capacity = new_capacity;
-		list = new_list;
+	// Remove old index entry if exists
+	if (old_distance != UINT32_MAX) {
+		struct distance_uid_key old_key;
+		old_key.distance = old_distance;
+		old_key.uid = uid;
+		key.mv_data = &old_key;
+		key.mv_size = sizeof(old_key);
+		mdb_del(txn, distance_idx_dbi, &key, NULL);
 	}
 
-	list->uids[list->count++] = uid;
+	// Update distance in main db
+	key.mv_data = &uid;
+	key.mv_size = sizeof(ndb_uid_t);
+	val.mv_data = &new_distance;
+	val.mv_size = sizeof(uint32_t);
+	if ((rc = mdb_put(txn, distance_dbi, &key, &val, 0)))
+		return 0;
+
+	// Add new index entry
+	struct distance_uid_key new_key;
+	new_key.distance = new_distance;
+	new_key.uid = uid;
+	key.mv_data = &new_key;
+	key.mv_size = sizeof(new_key);
+	val.mv_data = NULL;
+	val.mv_size = 0;
+	if ((rc = mdb_put(txn, distance_idx_dbi, &key, &val, 0)))
+		return 0;
+
 	return 1;
 }
 
-static size_t uid_list_size(struct uid_list *list)
+// Helper: remove distance from both databases
+static int remove_follow_distance(void *txn, struct ndb_socialgraph *graph,
+                                   ndb_uid_t uid, uint32_t old_distance)
 {
-	return sizeof(struct uid_list) + list->count * sizeof(ndb_uid_t);
+	MDB_dbi distance_dbi = (MDB_dbi)(intptr_t)graph->follow_distance_db;
+	MDB_dbi distance_idx_dbi = (MDB_dbi)(intptr_t)graph->users_by_follow_distance_db;
+	MDB_val key;
+
+	// Remove from index
+	struct distance_uid_key idx_key;
+	idx_key.distance = old_distance;
+	idx_key.uid = uid;
+	key.mv_data = &idx_key;
+	key.mv_size = sizeof(idx_key);
+	mdb_del(txn, distance_idx_dbi, &key, NULL);
+
+	// Remove from main db
+	key.mv_data = &uid;
+	key.mv_size = sizeof(ndb_uid_t);
+	mdb_del(txn, distance_dbi, &key, NULL);
+
+	return 1;
+}
+
+// Incremental: add follower relationship and update distance
+static int add_follower_incremental(void *txn, struct ndb_socialgraph *graph,
+                                     ndb_uid_t followed_uid, ndb_uid_t follower_uid)
+{
+	MDB_dbi distance_dbi = (MDB_dbi)(intptr_t)graph->follow_distance_db;
+	MDB_val key, val;
+	int rc;
+
+	// Don't process if followed_uid is root
+	if (followed_uid == graph->root_uid)
+		return 1;
+
+	uint32_t new_distance;
+
+	// If follower is root, set followed to distance 1
+	if (follower_uid == graph->root_uid) {
+		new_distance = 1;
+	} else {
+		// Get follower's distance
+		key.mv_data = &follower_uid;
+		key.mv_size = sizeof(ndb_uid_t);
+		if ((rc = mdb_get(txn, distance_dbi, &key, &val)) != 0) {
+			// Follower has no distance, can't establish path
+			return 1;
+		}
+		uint32_t follower_distance;
+		memcpy(&follower_distance, val.mv_data, sizeof(uint32_t));
+		new_distance = follower_distance + 1;
+	}
+
+	// Get current distance of followed user
+	key.mv_data = &followed_uid;
+	key.mv_size = sizeof(ndb_uid_t);
+	uint32_t old_distance = UINT32_MAX;
+	if ((rc = mdb_get(txn, distance_dbi, &key, &val)) == 0) {
+		memcpy(&old_distance, val.mv_data, sizeof(uint32_t));
+		// Only update if new distance is better
+		if (new_distance >= old_distance)
+			return 1;
+	}
+
+	// Update distance
+	return update_follow_distance(txn, graph, followed_uid, old_distance, new_distance);
+}
+
+// Incremental: remove follower relationship and recalculate distance if needed
+static int remove_follower_incremental(void *txn, struct ndb_socialgraph *graph,
+                                        ndb_uid_t unfollowed_uid, ndb_uid_t follower_uid)
+{
+	MDB_dbi distance_dbi = (MDB_dbi)(intptr_t)graph->follow_distance_db;
+	MDB_dbi followers_by_user_dbi = (MDB_dbi)(intptr_t)graph->followers_by_user_db;
+	MDB_val key, val;
+	int rc;
+
+	// Don't process if unfollowed_uid is root
+	if (unfollowed_uid == graph->root_uid)
+		return 1;
+
+	// Get current distance
+	key.mv_data = &unfollowed_uid;
+	key.mv_size = sizeof(ndb_uid_t);
+	if ((rc = mdb_get(txn, distance_dbi, &key, &val)) != 0) {
+		// No distance set, nothing to update
+		return 1;
+	}
+	uint32_t old_distance;
+	memcpy(&old_distance, val.mv_data, sizeof(uint32_t));
+
+	// Find minimum distance among remaining followers using cursor
+	uint32_t min_distance = UINT32_MAX;
+	MDB_cursor *cursor;
+	if ((rc = mdb_cursor_open(txn, followers_by_user_dbi, &cursor)) == 0) {
+		// Seek to first follower: (unfollowed_uid, 0)
+		struct follower_key seek_key;
+		seek_key.followed_uid = unfollowed_uid;
+		seek_key.follower_uid = 0;
+
+		key.mv_data = &seek_key;
+		key.mv_size = sizeof(seek_key);
+
+		rc = mdb_cursor_get(cursor, &key, &val, MDB_SET_RANGE);
+
+		while (rc == 0) {
+			struct follower_key *fkey = (struct follower_key*)key.mv_data;
+
+			// Stop if we've moved past this followed_uid
+			if (fkey->followed_uid != unfollowed_uid)
+				break;
+
+			// Get follower's distance
+			MDB_val f_key, f_val;
+			f_key.mv_data = &fkey->follower_uid;
+			f_key.mv_size = sizeof(ndb_uid_t);
+			if ((rc = mdb_get(txn, distance_dbi, &f_key, &f_val)) == 0) {
+				uint32_t f_distance;
+				memcpy(&f_distance, f_val.mv_data, sizeof(uint32_t));
+				uint32_t candidate = f_distance + 1;
+				if (candidate < min_distance)
+					min_distance = candidate;
+			}
+
+			rc = mdb_cursor_get(cursor, &key, &val, MDB_NEXT);
+		}
+
+		mdb_cursor_close(cursor);
+	}
+
+	// Update or remove distance
+	if (min_distance == UINT32_MAX) {
+		// No path to unfollowed_uid anymore
+		return remove_follow_distance(txn, graph, unfollowed_uid, old_distance);
+	} else if (min_distance != old_distance) {
+		// Distance changed
+		return update_follow_distance(txn, graph, unfollowed_uid, old_distance, min_distance);
+	}
+
+	return 1;
 }
 
 int ndb_socialgraph_init(struct ndb_socialgraph *graph, void *env,
@@ -84,13 +234,20 @@ int ndb_socialgraph_init(struct ndb_socialgraph *graph, void *env,
 	}
 
 	// Create databases
-	MDB_dbi follow_distance_dbi, followed_by_user_dbi;
-	MDB_dbi followers_by_user_dbi, follow_list_created_at_dbi;
+	MDB_dbi follow_distance_dbi, users_by_follow_distance_dbi, followed_by_user_dbi;
+	MDB_dbi followers_by_user_dbi, follower_count_dbi, follow_list_created_at_dbi;
+	MDB_dbi muted_by_user_dbi, user_muted_by_dbi, muter_count_dbi, mute_list_created_at_dbi;
 
 	if ((rc = mdb_dbi_open(txn, "sg_follow_distance", MDB_CREATE, &follow_distance_dbi)) ||
+	    (rc = mdb_dbi_open(txn, "sg_users_by_follow_distance", MDB_CREATE, &users_by_follow_distance_dbi)) ||
 	    (rc = mdb_dbi_open(txn, "sg_followed_by_user", MDB_CREATE, &followed_by_user_dbi)) ||
 	    (rc = mdb_dbi_open(txn, "sg_followers_by_user", MDB_CREATE, &followers_by_user_dbi)) ||
-	    (rc = mdb_dbi_open(txn, "sg_follow_list_created_at", MDB_CREATE, &follow_list_created_at_dbi))) {
+	    (rc = mdb_dbi_open(txn, "sg_follower_count", MDB_CREATE, &follower_count_dbi)) ||
+	    (rc = mdb_dbi_open(txn, "sg_follow_list_created_at", MDB_CREATE, &follow_list_created_at_dbi)) ||
+	    (rc = mdb_dbi_open(txn, "sg_muted_by_user", MDB_CREATE, &muted_by_user_dbi)) ||
+	    (rc = mdb_dbi_open(txn, "sg_user_muted_by", MDB_CREATE, &user_muted_by_dbi)) ||
+	    (rc = mdb_dbi_open(txn, "sg_muter_count", MDB_CREATE, &muter_count_dbi)) ||
+	    (rc = mdb_dbi_open(txn, "sg_mute_list_created_at", MDB_CREATE, &mute_list_created_at_dbi))) {
 		fprintf(stderr, "ndb_socialgraph_init: failed to open databases: %s\n",
 			mdb_strerror(rc));
 		mdb_txn_abort(txn);
@@ -99,32 +256,82 @@ int ndb_socialgraph_init(struct ndb_socialgraph *graph, void *env,
 	}
 
 	graph->follow_distance_db = (void*)(intptr_t)follow_distance_dbi;
+	graph->users_by_follow_distance_db = (void*)(intptr_t)users_by_follow_distance_dbi;
 	graph->followed_by_user_db = (void*)(intptr_t)followed_by_user_dbi;
 	graph->followers_by_user_db = (void*)(intptr_t)followers_by_user_dbi;
+	graph->follower_count_db = (void*)(intptr_t)follower_count_dbi;
 	graph->follow_list_created_at_db = (void*)(intptr_t)follow_list_created_at_dbi;
+	graph->muted_by_user_db = (void*)(intptr_t)muted_by_user_dbi;
+	graph->user_muted_by_db = (void*)(intptr_t)user_muted_by_dbi;
+	graph->muter_count_db = (void*)(intptr_t)muter_count_dbi;
+	graph->mute_list_created_at_db = (void*)(intptr_t)mute_list_created_at_dbi;
 
-	// Get or create UID for root
-	if (!ndb_uid_get_or_create(txn, &graph->uid_map, root_pubkey, &graph->root_uid)) {
-		fprintf(stderr, "ndb_socialgraph_init: failed to get root uid\n");
-		mdb_txn_abort(txn);
-		ndb_uid_map_destroy(&graph->uid_map);
-		return 0;
+	// Check if a root already exists (distance 0 user) via index
+	MDB_cursor *cursor;
+	MDB_val key, val;
+	int found_existing_root = 0;
+
+	if ((rc = mdb_cursor_open(txn, users_by_follow_distance_dbi, &cursor)) == 0) {
+		struct distance_uid_key search_key;
+		search_key.distance = 0;
+		search_key.uid = 0;
+		key.mv_data = &search_key;
+		key.mv_size = sizeof(search_key);
+
+		// Position cursor at first distance=0 entry
+		if ((rc = mdb_cursor_get(cursor, &key, &val, MDB_SET_RANGE)) == 0) {
+			if (key.mv_size == sizeof(struct distance_uid_key)) {
+				struct distance_uid_key *found_key = (struct distance_uid_key*)key.mv_data;
+				if (found_key->distance == 0) {
+					// Found existing root
+					graph->root_uid = found_key->uid;
+					found_existing_root = 1;
+				}
+			}
+		}
+		mdb_cursor_close(cursor);
 	}
 
-	// Set root distance to 0
-	MDB_val key, val;
-	key.mv_data = &graph->root_uid;
-	key.mv_size = sizeof(ndb_uid_t);
-	uint32_t zero = 0;
-	val.mv_data = &zero;
-	val.mv_size = sizeof(uint32_t);
+	if (!found_existing_root) {
+		// No existing root, use provided root_pubkey
+		if (!ndb_uid_get_or_create(txn, &graph->uid_map, root_pubkey, &graph->root_uid)) {
+			fprintf(stderr, "ndb_socialgraph_init: failed to get root uid\n");
+			mdb_txn_abort(txn);
+			ndb_uid_map_destroy(&graph->uid_map);
+			return 0;
+		}
 
-	if ((rc = mdb_put(txn, follow_distance_dbi, &key, &val, 0))) {
-		fprintf(stderr, "ndb_socialgraph_init: failed to set root distance: %s\n",
-			mdb_strerror(rc));
-		mdb_txn_abort(txn);
-		ndb_uid_map_destroy(&graph->uid_map);
-		return 0;
+		// Set root distance to 0 in both databases
+		key.mv_data = &graph->root_uid;
+		key.mv_size = sizeof(ndb_uid_t);
+		uint32_t zero = 0;
+		val.mv_data = &zero;
+		val.mv_size = sizeof(uint32_t);
+
+		if ((rc = mdb_put(txn, follow_distance_dbi, &key, &val, 0))) {
+			fprintf(stderr, "ndb_socialgraph_init: failed to set root distance: %s\n",
+				mdb_strerror(rc));
+			mdb_txn_abort(txn);
+			ndb_uid_map_destroy(&graph->uid_map);
+			return 0;
+		}
+
+		// Add to index
+		struct distance_uid_key idx_key;
+		idx_key.distance = 0;
+		idx_key.uid = graph->root_uid;
+		key.mv_data = &idx_key;
+		key.mv_size = sizeof(idx_key);
+		val.mv_data = NULL;
+		val.mv_size = 0;
+
+		if ((rc = mdb_put(txn, users_by_follow_distance_dbi, &key, &val, 0))) {
+			fprintf(stderr, "ndb_socialgraph_init: failed to set root index: %s\n",
+				mdb_strerror(rc));
+			mdb_txn_abort(txn);
+			ndb_uid_map_destroy(&graph->uid_map);
+			return 0;
+		}
 	}
 
 	if ((rc = mdb_txn_commit(txn))) {
@@ -233,97 +440,109 @@ int ndb_socialgraph_handle_contact_list(void *txn, struct ndb_socialgraph *graph
 			memcpy(old_followed_list, val.mv_data, val.mv_size);
 	}
 
-	// Process unfollows: remove from followers_by_user
+	// Process unfollows: remove from followers_by_user and update distances
 	if (old_followed_list) {
 		for (uint32_t i = 0; i < old_followed_list->count; i++) {
-			ndb_uid_t unfollowed_uid = old_followed_list->uids[i];
+			ndb_uid_t unfollowed_uid = uid_list_get(old_followed_list, i);
 
 			// Skip if still followed
 			if (uid_list_contains(new_followed_list, unfollowed_uid))
 				continue;
 
-			// Remove author from this user's followers
-			MDB_val follower_key, follower_val;
-			follower_key.mv_data = &unfollowed_uid;
-			follower_key.mv_size = sizeof(ndb_uid_t);
+			// Remove composite key entry (followed_uid, follower_uid)
+			struct follower_key fkey;
+			fkey.followed_uid = unfollowed_uid;
+			fkey.follower_uid = author_uid;
 
-			if ((rc = mdb_get(txn, followers_by_user_dbi, &follower_key, &follower_val)) == 0) {
-				struct uid_list *followers = malloc(follower_val.mv_size);
-				if (followers) {
-					memcpy(followers, follower_val.mv_data, follower_val.mv_size);
+			MDB_val composite_key;
+			composite_key.mv_data = &fkey;
+			composite_key.mv_size = sizeof(fkey);
 
-					// Remove author_uid from followers list
-					for (uint32_t j = 0; j < followers->count; j++) {
-						if (followers->uids[j] == author_uid) {
-							// Shift remaining elements
-							memmove(&followers->uids[j], &followers->uids[j+1],
-							        (followers->count - j - 1) * sizeof(ndb_uid_t));
-							followers->count--;
-							break;
-						}
-					}
+			mdb_del(txn, followers_by_user_dbi, &composite_key, NULL);
 
-					// Update or delete
-					if (followers->count == 0) {
-						mdb_del(txn, followers_by_user_dbi, &follower_key, NULL);
-					} else {
-						follower_val.mv_data = followers;
-						follower_val.mv_size = uid_list_size(followers);
-						mdb_put(txn, followers_by_user_dbi, &follower_key, &follower_val, 0);
-					}
-					free(followers);
-				}
+			// Decrement follower count
+			MDB_dbi follower_count_dbi = (MDB_dbi)(intptr_t)graph->follower_count_db;
+			MDB_val count_key, count_val;
+			count_key.mv_data = &unfollowed_uid;
+			count_key.mv_size = sizeof(ndb_uid_t);
+
+			uint32_t count = 0;
+			if (mdb_get(txn, follower_count_dbi, &count_key, &count_val) == 0) {
+				memcpy(&count, count_val.mv_data, sizeof(uint32_t));
+				if (count > 0) count--;
 			}
+			count_val.mv_data = &count;
+			count_val.mv_size = sizeof(uint32_t);
+			mdb_put(txn, follower_count_dbi, &count_key, &count_val, 0);
+
+			// Incremental distance update for unfollow
+			remove_follower_incremental(txn, graph, unfollowed_uid, author_uid);
 		}
-		free(old_followed_list);
 	}
 
-	// Process new follows: add to followers_by_user
+	// Process new follows: add to followers_by_followed composite index
 	for (uint32_t i = 0; i < new_followed_list->count; i++) {
-		ndb_uid_t followed_uid = new_followed_list->uids[i];
+		ndb_uid_t followed_uid = uid_list_get(new_followed_list, i);
 
-		MDB_val follower_key, follower_val;
-		follower_key.mv_data = &followed_uid;
-		follower_key.mv_size = sizeof(ndb_uid_t);
+		// Check if this is a new follow (not in old list)
+		int is_new = 1;
+		if (old_followed_list && uid_list_contains(old_followed_list, followed_uid))
+			is_new = 0;
 
-		struct uid_list *followers = NULL;
-		uint32_t followers_capacity = 64;
+		if (!is_new)
+			continue;
 
-		if ((rc = mdb_get(txn, followers_by_user_dbi, &follower_key, &follower_val)) == 0) {
-			// Existing followers list
-			followers = malloc(follower_val.mv_size);
-			if (!followers) {
-				free(new_followed_list);
-				return 0;
-			}
-			memcpy(followers, follower_val.mv_data, follower_val.mv_size);
-			followers_capacity = followers->count + 16; // Some headroom
-		} else {
-			// New followers list
-			followers = uid_list_create(followers_capacity);
-			if (!followers) {
-				free(new_followed_list);
-				return 0;
-			}
-		}
+		// Add composite key entry (followed_uid, follower_uid)
+		struct follower_key fkey;
+		fkey.followed_uid = followed_uid;
+		fkey.follower_uid = author_uid;
 
-		// Add author to followers list
-		if (!uid_list_add(&followers, &followers_capacity, author_uid)) {
-			free(followers);
+		MDB_val composite_key, empty_val;
+		composite_key.mv_data = &fkey;
+		composite_key.mv_size = sizeof(fkey);
+		empty_val.mv_data = NULL;
+		empty_val.mv_size = 0;
+
+		if ((rc = mdb_put(txn, followers_by_user_dbi, &composite_key, &empty_val, 0))) {
 			free(new_followed_list);
+			if (old_followed_list) free(old_followed_list);
 			return 0;
 		}
 
-		// Store updated followers list
-		follower_val.mv_data = followers;
-		follower_val.mv_size = uid_list_size(followers);
-		if ((rc = mdb_put(txn, followers_by_user_dbi, &follower_key, &follower_val, 0))) {
-			free(followers);
-			free(new_followed_list);
-			return 0;
+		// Increment follower count
+		MDB_dbi follower_count_dbi = (MDB_dbi)(intptr_t)graph->follower_count_db;
+		MDB_val count_key, count_val;
+		count_key.mv_data = &followed_uid;
+		count_key.mv_size = sizeof(ndb_uid_t);
+
+		uint32_t count = 0;
+		if (mdb_get(txn, follower_count_dbi, &count_key, &count_val) == 0) {
+			memcpy(&count, count_val.mv_data, sizeof(uint32_t));
 		}
-		free(followers);
+		count++;
+		count_val.mv_data = &count;
+		count_val.mv_size = sizeof(uint32_t);
+		mdb_put(txn, follower_count_dbi, &count_key, &count_val, 0);
 	}
+
+	// After updating all follower relationships, update distances incrementally
+	for (uint32_t i = 0; i < new_followed_list->count; i++) {
+		ndb_uid_t followed_uid = uid_list_get(new_followed_list, i);
+
+		// Check if this is a new follow (not in old list)
+		int is_new = 1;
+		if (old_followed_list && uid_list_contains(old_followed_list, followed_uid))
+			is_new = 0;
+
+		if (!is_new)
+			continue;
+
+		add_follower_incremental(txn, graph, followed_uid, author_uid);
+	}
+
+	// Free old followed list after both loops complete
+	if (old_followed_list)
+		free(old_followed_list);
 
 	// Store new followed list
 	val.mv_data = new_followed_list;
@@ -343,19 +562,24 @@ int ndb_socialgraph_handle_contact_list(void *txn, struct ndb_socialgraph *graph
 
 	free(new_followed_list);
 
-	// Trigger distance recalculation
-	return ndb_socialgraph_recalculate_distances(txn, graph);
+	return 1;
 }
 
 int ndb_socialgraph_recalculate_distances(void *txn, struct ndb_socialgraph *graph)
 {
 	MDB_dbi distance_dbi = (MDB_dbi)(intptr_t)graph->follow_distance_db;
+	MDB_dbi distance_idx_dbi = (MDB_dbi)(intptr_t)graph->users_by_follow_distance_db;
 	MDB_dbi followed_dbi = (MDB_dbi)(intptr_t)graph->followed_by_user_db;
 	int rc;
 
-	// Clear existing distances
+	// Clear existing distances and index
 	if ((rc = mdb_drop(txn, distance_dbi, 0))) {
 		fprintf(stderr, "ndb_socialgraph_recalculate_distances: mdb_drop failed: %s\n",
+			mdb_strerror(rc));
+		return 0;
+	}
+	if ((rc = mdb_drop(txn, distance_idx_dbi, 0))) {
+		fprintf(stderr, "ndb_socialgraph_recalculate_distances: mdb_drop index failed: %s\n",
 			mdb_strerror(rc));
 		return 0;
 	}
@@ -369,7 +593,7 @@ int ndb_socialgraph_recalculate_distances(void *txn, struct ndb_socialgraph *gra
 	if (!queue)
 		return 0;
 
-	// Set root distance to 0
+	// Set root distance to 0 in both databases
 	MDB_val key, val;
 	key.mv_data = &graph->root_uid;
 	key.mv_size = sizeof(ndb_uid_t);
@@ -378,6 +602,20 @@ int ndb_socialgraph_recalculate_distances(void *txn, struct ndb_socialgraph *gra
 	val.mv_size = sizeof(uint32_t);
 
 	if ((rc = mdb_put(txn, distance_dbi, &key, &val, 0))) {
+		free(queue);
+		return 0;
+	}
+
+	// Add to index
+	struct distance_uid_key idx_key;
+	idx_key.distance = 0;
+	idx_key.uid = graph->root_uid;
+	key.mv_data = &idx_key;
+	key.mv_size = sizeof(idx_key);
+	val.mv_data = NULL;
+	val.mv_size = 0;
+
+	if ((rc = mdb_put(txn, distance_idx_dbi, &key, &val, 0))) {
 		free(queue);
 		return 0;
 	}
@@ -406,7 +644,7 @@ int ndb_socialgraph_recalculate_distances(void *txn, struct ndb_socialgraph *gra
 		struct uid_list *followed = (struct uid_list*)val.mv_data;
 
 		for (uint32_t i = 0; i < followed->count; i++) {
-			ndb_uid_t followed_uid = followed->uids[i];
+			ndb_uid_t followed_uid = uid_list_get(followed, i);
 
 			// Check if already has a distance
 			MDB_val check_key, check_val;
@@ -422,6 +660,18 @@ int ndb_socialgraph_recalculate_distances(void *txn, struct ndb_socialgraph *gra
 			check_val.mv_data = &next_distance;
 			check_val.mv_size = sizeof(uint32_t);
 			if ((rc = mdb_put(txn, distance_dbi, &check_key, &check_val, 0))) {
+				free(queue);
+				return 0;
+			}
+
+			// Add to index
+			idx_key.distance = next_distance;
+			idx_key.uid = followed_uid;
+			check_key.mv_data = &idx_key;
+			check_key.mv_size = sizeof(idx_key);
+			check_val.mv_data = NULL;
+			check_val.mv_size = 0;
+			if ((rc = mdb_put(txn, distance_idx_dbi, &check_key, &check_val, 0))) {
 				free(queue);
 				return 0;
 			}
@@ -509,7 +759,7 @@ int ndb_sg_get_followed(void *txn, struct ndb_socialgraph *graph,
 	int count = followed->count < max_out ? followed->count : max_out;
 
 	for (int i = 0; i < count; i++) {
-		if (!ndb_uid_to_pubkey(txn, &graph->uid_map, followed->uids[i],
+		if (!ndb_uid_to_pubkey(txn, &graph->uid_map, uid_list_get(followed, i),
 		                       &followed_out[i * 32])) {
 			return i;
 		}
@@ -522,29 +772,49 @@ int ndb_sg_get_followers(void *txn, struct ndb_socialgraph *graph,
                          const unsigned char *pubkey,
                          unsigned char *followers_out, int max_out)
 {
-	ndb_uid_t uid;
-	MDB_val key, val;
+	ndb_uid_t followed_uid;
 	MDB_dbi dbi = (MDB_dbi)(intptr_t)graph->followers_by_user_db;
+	MDB_cursor *cursor;
+	int rc, count = 0;
 
-	if (!ndb_uid_get(txn, &graph->uid_map, pubkey, &uid))
+	if (!ndb_uid_get(txn, &graph->uid_map, pubkey, &followed_uid))
 		return 0;
 
-	key.mv_data = &uid;
-	key.mv_size = sizeof(ndb_uid_t);
-
-	if (mdb_get(txn, dbi, &key, &val) != 0)
+	// Open cursor to iterate composite keys with prefix (followed_uid, *)
+	if ((rc = mdb_cursor_open(txn, dbi, &cursor))) {
 		return 0;
-
-	struct uid_list *followers = (struct uid_list*)val.mv_data;
-	int count = followers->count < max_out ? followers->count : max_out;
-
-	for (int i = 0; i < count; i++) {
-		if (!ndb_uid_to_pubkey(txn, &graph->uid_map, followers->uids[i],
-		                       &followers_out[i * 32])) {
-			return i;
-		}
 	}
 
+	// Seek to first follower: (followed_uid, 0)
+	struct follower_key seek_key;
+	seek_key.followed_uid = followed_uid;
+	seek_key.follower_uid = 0;
+
+	MDB_val key, val;
+	key.mv_data = &seek_key;
+	key.mv_size = sizeof(seek_key);
+
+	// Use MDB_SET_RANGE to find first key >= seek_key
+	rc = mdb_cursor_get(cursor, &key, &val, MDB_SET_RANGE);
+
+	while (rc == 0 && count < max_out) {
+		struct follower_key *fkey = (struct follower_key*)key.mv_data;
+
+		// Stop if we've moved past this followed_uid
+		if (fkey->followed_uid != followed_uid)
+			break;
+
+		// Convert follower UID to pubkey
+		if (!ndb_uid_to_pubkey(txn, &graph->uid_map, fkey->follower_uid,
+		                       &followers_out[count * 32])) {
+			break;
+		}
+
+		count++;
+		rc = mdb_cursor_get(cursor, &key, &val, MDB_NEXT);
+	}
+
+	mdb_cursor_close(cursor);
 	return count;
 }
 
@@ -553,7 +823,7 @@ int ndb_sg_follower_count(void *txn, struct ndb_socialgraph *graph,
 {
 	ndb_uid_t uid;
 	MDB_val key, val;
-	MDB_dbi dbi = (MDB_dbi)(intptr_t)graph->followers_by_user_db;
+	MDB_dbi dbi = (MDB_dbi)(intptr_t)graph->follower_count_db;
 
 	if (!ndb_uid_get(txn, &graph->uid_map, pubkey, &uid))
 		return 0;
@@ -564,8 +834,365 @@ int ndb_sg_follower_count(void *txn, struct ndb_socialgraph *graph,
 	if (mdb_get(txn, dbi, &key, &val) != 0)
 		return 0;
 
-	struct uid_list *followers = (struct uid_list*)val.mv_data;
-	return followers->count;
+	uint32_t count;
+	memcpy(&count, val.mv_data, sizeof(uint32_t));
+	return count;
+}
+
+int ndb_sg_followed_count(void *txn, struct ndb_socialgraph *graph,
+                          const unsigned char *pubkey)
+{
+	ndb_uid_t uid;
+	MDB_val key, val;
+	MDB_dbi dbi = (MDB_dbi)(intptr_t)graph->followed_by_user_db;
+
+	if (!ndb_uid_get(txn, &graph->uid_map, pubkey, &uid))
+		return 0;
+
+	key.mv_data = &uid;
+	key.mv_size = sizeof(ndb_uid_t);
+
+	if (mdb_get(txn, dbi, &key, &val) != 0)
+		return 0;
+
+	struct uid_list *followed = (struct uid_list*)val.mv_data;
+	return followed->count;
+}
+
+int ndb_sg_muter_count(void *txn, struct ndb_socialgraph *graph,
+                       const unsigned char *pubkey)
+{
+	ndb_uid_t uid;
+	MDB_val key, val;
+	MDB_dbi dbi = (MDB_dbi)(intptr_t)graph->muter_count_db;
+
+	if (!ndb_uid_get(txn, &graph->uid_map, pubkey, &uid))
+		return 0;
+
+	key.mv_data = &uid;
+	key.mv_size = sizeof(ndb_uid_t);
+
+	if (mdb_get(txn, dbi, &key, &val) != 0)
+		return 0;
+
+	uint32_t count;
+	memcpy(&count, val.mv_data, sizeof(uint32_t));
+	return count;
+}
+
+int ndb_socialgraph_handle_mute_list(void *txn, struct ndb_socialgraph *graph,
+                                     struct ndb_note *note)
+{
+	MDB_val key, val;
+	int rc;
+	ndb_uid_t author_uid;
+	uint64_t created_at;
+	struct uid_list *new_muted_list;
+	uint32_t new_muted_capacity = 64;
+
+	// Get author UID
+	if (!ndb_uid_get_or_create(txn, &graph->uid_map, ndb_note_pubkey(note), &author_uid))
+		return 0;
+
+	created_at = ndb_note_created_at(note);
+
+	// Check if we have a newer mute list already
+	MDB_dbi created_at_dbi = (MDB_dbi)(intptr_t)graph->mute_list_created_at_db;
+	key.mv_data = &author_uid;
+	key.mv_size = sizeof(ndb_uid_t);
+
+	if ((rc = mdb_get(txn, created_at_dbi, &key, &val)) == 0) {
+		if (val.mv_size == sizeof(uint64_t)) {
+			uint64_t existing_created_at;
+			memcpy(&existing_created_at, val.mv_data, sizeof(uint64_t));
+			if (created_at <= existing_created_at) {
+				// Older or same timestamp, ignore
+				return 1;
+			}
+		}
+	}
+
+	// Parse p-tags to build new mute list
+	new_muted_list = uid_list_create(new_muted_capacity);
+	if (!new_muted_list)
+		return 0;
+
+	// Iterate over tags
+	struct ndb_iterator iter, *it = &iter;
+	ndb_tags_iterate_start(note, it);
+
+	while (ndb_tags_iterate_next(it)) {
+		if (ndb_tag_count(it->tag) < 2)
+			continue;
+
+		// Check if it's a 'p' tag
+		struct ndb_str str = ndb_tag_str(note, it->tag, 0);
+		if (str.flag != NDB_PACKED_STR || str.str[0] != 'p' || str.str[1] != '\0')
+			continue;
+
+		// Get the pubkey from tag[1]
+		str = ndb_tag_str(note, it->tag, 1);
+
+		unsigned char pubkey[32];
+		if (str.flag == NDB_PACKED_ID) {
+			// Already binary
+			memcpy(pubkey, str.id, 32);
+		} else if (str.flag == NDB_PACKED_STR) {
+			// Hex string, need to decode
+			if (strlen(str.str) != 64)
+				continue;
+			if (!hex_decode(str.str, 64, pubkey, 32))
+				continue;
+		} else {
+			continue;
+		}
+
+		// Get UID for muted user
+		ndb_uid_t muted_uid;
+		if (!ndb_uid_get_or_create(txn, &graph->uid_map, pubkey, &muted_uid)) {
+			free(new_muted_list);
+			return 0;
+		}
+
+		// Don't add self-mutes
+		if (muted_uid == author_uid)
+			continue;
+
+		if (!uid_list_add(&new_muted_list, &new_muted_capacity, muted_uid)) {
+			free(new_muted_list);
+			return 0;
+		}
+	}
+
+	// Get old mute list
+	MDB_dbi muted_by_user_dbi = (MDB_dbi)(intptr_t)graph->muted_by_user_db;
+	MDB_dbi user_muted_by_dbi = (MDB_dbi)(intptr_t)graph->user_muted_by_db;
+
+	struct uid_list *old_muted_list = NULL;
+	if ((rc = mdb_get(txn, muted_by_user_dbi, &key, &val)) == 0) {
+		// Copy old list
+		old_muted_list = malloc(val.mv_size);
+		if (old_muted_list)
+			memcpy(old_muted_list, val.mv_data, val.mv_size);
+	}
+
+	// Process unmutes: remove from user_muted_by
+	if (old_muted_list) {
+		for (uint32_t i = 0; i < old_muted_list->count; i++) {
+			ndb_uid_t unmuted_uid = uid_list_get(old_muted_list, i);
+
+			// Skip if still muted
+			if (uid_list_contains(new_muted_list, unmuted_uid))
+				continue;
+
+			// Remove composite key entry (muted_uid, muter_uid)
+			struct muter_key mkey;
+			mkey.muted_uid = unmuted_uid;
+			mkey.muter_uid = author_uid;
+
+			MDB_val composite_key;
+			composite_key.mv_data = &mkey;
+			composite_key.mv_size = sizeof(mkey);
+
+			mdb_del(txn, user_muted_by_dbi, &composite_key, NULL);
+
+			// Decrement muter count
+			MDB_dbi muter_count_dbi = (MDB_dbi)(intptr_t)graph->muter_count_db;
+			MDB_val count_key, count_val;
+			count_key.mv_data = &unmuted_uid;
+			count_key.mv_size = sizeof(ndb_uid_t);
+
+			uint32_t count = 0;
+			if (mdb_get(txn, muter_count_dbi, &count_key, &count_val) == 0) {
+				memcpy(&count, count_val.mv_data, sizeof(uint32_t));
+				if (count > 0) count--;
+			}
+			count_val.mv_data = &count;
+			count_val.mv_size = sizeof(uint32_t);
+			mdb_put(txn, muter_count_dbi, &count_key, &count_val, 0);
+		}
+		free(old_muted_list);
+	}
+
+	// Process new mutes: add to muters_by_muted composite index
+	for (uint32_t i = 0; i < new_muted_list->count; i++) {
+		ndb_uid_t muted_uid = uid_list_get(new_muted_list, i);
+
+		// Add composite key entry (muted_uid, muter_uid)
+		struct muter_key mkey;
+		mkey.muted_uid = muted_uid;
+		mkey.muter_uid = author_uid;
+
+		MDB_val composite_key, empty_val;
+		composite_key.mv_data = &mkey;
+		composite_key.mv_size = sizeof(mkey);
+		empty_val.mv_data = NULL;
+		empty_val.mv_size = 0;
+
+		if ((rc = mdb_put(txn, user_muted_by_dbi, &composite_key, &empty_val, 0))) {
+			free(new_muted_list);
+			return 0;
+		}
+
+		// Increment muter count
+		MDB_dbi muter_count_dbi = (MDB_dbi)(intptr_t)graph->muter_count_db;
+		MDB_val count_key, count_val;
+		count_key.mv_data = &muted_uid;
+		count_key.mv_size = sizeof(ndb_uid_t);
+
+		uint32_t count = 0;
+		if (mdb_get(txn, muter_count_dbi, &count_key, &count_val) == 0) {
+			memcpy(&count, count_val.mv_data, sizeof(uint32_t));
+		}
+		count++;
+		count_val.mv_data = &count;
+		count_val.mv_size = sizeof(uint32_t);
+		mdb_put(txn, muter_count_dbi, &count_key, &count_val, 0);
+	}
+
+	// Store new muted list
+	val.mv_data = new_muted_list;
+	val.mv_size = uid_list_size(new_muted_list);
+	if ((rc = mdb_put(txn, muted_by_user_dbi, &key, &val, 0))) {
+		free(new_muted_list);
+		return 0;
+	}
+
+	// Update created_at timestamp
+	val.mv_data = &created_at;
+	val.mv_size = sizeof(uint64_t);
+	if ((rc = mdb_put(txn, created_at_dbi, &key, &val, 0))) {
+		free(new_muted_list);
+		return 0;
+	}
+
+	free(new_muted_list);
+	return 1;
+}
+
+int ndb_sg_is_muting(void *txn, struct ndb_socialgraph *graph,
+                     const unsigned char *muter_pubkey,
+                     const unsigned char *muted_pubkey)
+{
+	ndb_uid_t muter_uid, muted_uid;
+	MDB_val key, val;
+	MDB_dbi dbi = (MDB_dbi)(intptr_t)graph->muted_by_user_db;
+
+	if (!ndb_uid_get(txn, &graph->uid_map, muter_pubkey, &muter_uid))
+		return 0;
+	if (!ndb_uid_get(txn, &graph->uid_map, muted_pubkey, &muted_uid))
+		return 0;
+
+	key.mv_data = &muter_uid;
+	key.mv_size = sizeof(ndb_uid_t);
+
+	if (mdb_get(txn, dbi, &key, &val) != 0)
+		return 0;
+
+	struct uid_list *muted = (struct uid_list*)val.mv_data;
+	return uid_list_contains(muted, muted_uid);
+}
+
+int ndb_sg_get_muted(void *txn, struct ndb_socialgraph *graph,
+                     const unsigned char *pubkey,
+                     unsigned char *muted_out, int max_out)
+{
+	ndb_uid_t uid;
+	MDB_val key, val;
+	MDB_dbi dbi = (MDB_dbi)(intptr_t)graph->muted_by_user_db;
+
+	if (!ndb_uid_get(txn, &graph->uid_map, pubkey, &uid))
+		return 0;
+
+	key.mv_data = &uid;
+	key.mv_size = sizeof(ndb_uid_t);
+
+	if (mdb_get(txn, dbi, &key, &val) != 0)
+		return 0;
+
+	struct uid_list *muted = (struct uid_list*)val.mv_data;
+	int count = muted->count < max_out ? muted->count : max_out;
+
+	for (int i = 0; i < count; i++) {
+		if (!ndb_uid_to_pubkey(txn, &graph->uid_map, uid_list_get(muted, i),
+		                       &muted_out[i * 32])) {
+			return i;
+		}
+	}
+
+	return count;
+}
+
+int ndb_sg_get_muters(void *txn, struct ndb_socialgraph *graph,
+                      const unsigned char *pubkey,
+                      unsigned char *muters_out, int max_out)
+{
+	ndb_uid_t muted_uid;
+	MDB_dbi dbi = (MDB_dbi)(intptr_t)graph->user_muted_by_db;
+	MDB_cursor *cursor;
+	int rc, count = 0;
+
+	if (!ndb_uid_get(txn, &graph->uid_map, pubkey, &muted_uid))
+		return 0;
+
+	// Open cursor to iterate composite keys with prefix (muted_uid, *)
+	if ((rc = mdb_cursor_open(txn, dbi, &cursor))) {
+		return 0;
+	}
+
+	// Seek to first muter: (muted_uid, 0)
+	struct muter_key seek_key;
+	seek_key.muted_uid = muted_uid;
+	seek_key.muter_uid = 0;
+
+	MDB_val key, val;
+	key.mv_data = &seek_key;
+	key.mv_size = sizeof(seek_key);
+
+	// Use MDB_SET_RANGE to find first key >= seek_key
+	rc = mdb_cursor_get(cursor, &key, &val, MDB_SET_RANGE);
+
+	while (rc == 0 && count < max_out) {
+		struct muter_key *mkey = (struct muter_key*)key.mv_data;
+
+		// Stop if we've moved past this muted_uid
+		if (mkey->muted_uid != muted_uid)
+			break;
+
+		// Convert muter UID to pubkey
+		if (!ndb_uid_to_pubkey(txn, &graph->uid_map, mkey->muter_uid,
+		                       &muters_out[count * 32])) {
+			break;
+		}
+
+		count++;
+		rc = mdb_cursor_get(cursor, &key, &val, MDB_NEXT);
+	}
+
+	mdb_cursor_close(cursor);
+	return count;
+}
+
+int ndb_sg_set_root(void *txn, struct ndb_socialgraph *graph,
+                    const unsigned char *root_pubkey)
+{
+	ndb_uid_t new_root_uid;
+
+	// Get or create UID for new root
+	if (!ndb_uid_get_or_create(txn, &graph->uid_map, root_pubkey, &new_root_uid)) {
+		return 0;
+	}
+
+	// Check if root actually changed
+	if (new_root_uid == graph->root_uid) {
+		return 1; // No change needed
+	}
+
+	// Update root_uid
+	graph->root_uid = new_root_uid;
+
+	// Recalculate all distances from new root (handles both dbs)
+	return ndb_socialgraph_recalculate_distances(txn, graph);
 }
 
 void ndb_socialgraph_destroy(struct ndb_socialgraph *graph)
@@ -573,7 +1200,13 @@ void ndb_socialgraph_destroy(struct ndb_socialgraph *graph)
 	ndb_uid_map_destroy(&graph->uid_map);
 	graph->env = NULL;
 	graph->follow_distance_db = NULL;
+	graph->users_by_follow_distance_db = NULL;
 	graph->followed_by_user_db = NULL;
 	graph->followers_by_user_db = NULL;
+	graph->follower_count_db = NULL;
 	graph->follow_list_created_at_db = NULL;
+	graph->muted_by_user_db = NULL;
+	graph->user_muted_by_db = NULL;
+	graph->muter_count_db = NULL;
+	graph->mute_list_created_at_db = NULL;
 }

@@ -152,6 +152,7 @@ enum ndb_writer_msgtype {
 	NDB_WRITER_MIGRATE, // migrate the database
 	NDB_WRITER_NOTE_RELAY, // we already have the note, but we have more relays to write
 	NDB_WRITER_NOTE_META, // write note metadata to the db
+	NDB_WRITER_SET_ROOT, // set social graph root user
 };
 
 // keys used for storing data in the NDB metadata database (NDB_DB_NDB_META)
@@ -178,6 +179,7 @@ struct ndb_lmdb {
 struct ndb_writer {
 	struct ndb_lmdb *lmdb;
 	struct ndb_monitor *monitor;
+	struct ndb_socialgraph *socialgraph;
 
 	int scratch_size;
 	uint32_t ndb_flags;
@@ -2717,6 +2719,10 @@ struct ndb_writer_blocks {
 
 // The different types of messages that the writer thread can write to the
 // database
+struct ndb_writer_set_root {
+	unsigned char pubkey[32];
+};
+
 struct ndb_writer_msg {
 	enum ndb_writer_msgtype type;
 	union {
@@ -2727,6 +2733,7 @@ struct ndb_writer_msg {
 		struct ndb_writer_last_fetch last_fetch;
 		struct ndb_writer_blocks blocks;
 		struct ndb_writer_note_meta note_meta;
+		struct ndb_writer_set_root set_root;
 	};
 };
 
@@ -3325,6 +3332,18 @@ static int ndb_ingester_process_note(secp256k1_context *ctx,
 				mdb_txn_commit(txn);
 			}
 		}
+<<<<<<< HEAD
+=======
+	} else if (note->kind == 10000) {
+		// process mute list for social graph
+		if (ingester->socialgraph) {
+			MDB_txn *txn;
+			if (mdb_txn_begin(ingester->lmdb->env, NULL, 0, &txn) == 0) {
+				ndb_socialgraph_handle_mute_list((void*)txn, ingester->socialgraph, note);
+				mdb_txn_commit(txn);
+			}
+		}
+>>>>>>> master
 	} else if (note->kind == 6) {
 		// process the repost if we have a repost event
 		ndb_debug("processing kind 6 repost\n");
@@ -6351,6 +6370,7 @@ static void *ndb_writer_thread(void *data)
 			case NDB_WRITER_BLOCKS:
 			case NDB_WRITER_MIGRATE:
 			case NDB_WRITER_NOTE_RELAY:
+			case NDB_WRITER_SET_ROOT:
 				needs_commit = 1;
 				break;
 			case NDB_WRITER_QUIT: break;
@@ -6438,6 +6458,10 @@ static void *ndb_writer_thread(void *data)
 						msg->last_fetch.pubkey,
 						msg->last_fetch.fetched_at
 						);
+				break;
+			case NDB_WRITER_SET_ROOT:
+				ndb_sg_set_root(txn.mdb_txn, writer->socialgraph,
+				                msg->set_root.pubkey);
 				break;
 			}
 		}
@@ -6559,11 +6583,12 @@ static void *ndb_ingester_thread(void *data)
 
 
 static int ndb_writer_init(struct ndb_writer *writer, struct ndb_lmdb *lmdb,
-			   struct ndb_monitor *monitor, uint32_t ndb_flags,
-			   int scratch_size)
+			   struct ndb_monitor *monitor, struct ndb_socialgraph *socialgraph,
+			   uint32_t ndb_flags, int scratch_size)
 {
 	writer->lmdb = lmdb;
 	writer->monitor = monitor;
+	writer->socialgraph = socialgraph;
 	writer->ndb_flags = ndb_flags;
 	writer->scratch_size = scratch_size;
 	writer->queue_buflen = sizeof(struct ndb_writer_msg) * DEFAULT_QUEUE_SIZE;
@@ -6667,8 +6692,13 @@ static int ndb_init_lmdb(const char *filename, struct ndb_lmdb *lmdb, size_t map
 		return 0;
 	}
 
+<<<<<<< HEAD
 	// NDB_DBS + 6 extra for social graph (2 for uid mapping, 4 for graph data)
 	if ((rc = mdb_env_set_maxdbs(lmdb->env, NDB_DBS + 6))) {
+=======
+	// NDB_DBS + 12 extra for social graph (2 for uid mapping, 10 for graph data: 6 follow + 4 mute)
+	if ((rc = mdb_env_set_maxdbs(lmdb->env, NDB_DBS + 12))) {
+>>>>>>> master
 		fprintf(stderr, "mdb_env_set_maxdbs failed, error %d\n", rc);
 		return 0;
 	}
@@ -6875,8 +6905,16 @@ int ndb_init(struct ndb **pndb, const char *filename, const struct ndb_config *c
 
 	ndb_monitor_init(&ndb->monitor, config->sub_cb, config->sub_cb_ctx);
 
-	if (!ndb_writer_init(&ndb->writer, &ndb->lmdb, &ndb->monitor, ndb->flags,
-			     config->writer_scratch_buffer_size)) {
+	// Initialize social graph with a default root (can be updated later via API)
+	// Using zero pubkey as default - user should set their own root
+	unsigned char zero_pubkey[32] = {0};
+	if (!ndb_socialgraph_init(&ndb->socialgraph, ndb->lmdb.env, zero_pubkey)) {
+		fprintf(stderr, "ndb_socialgraph_init failed\n");
+		return 0;
+	}
+
+	if (!ndb_writer_init(&ndb->writer, &ndb->lmdb, &ndb->monitor, &ndb->socialgraph,
+			     ndb->flags, config->writer_scratch_buffer_size)) {
 		fprintf(stderr, "ndb_writer_init failed\n");
 		return 0;
 	}
@@ -9353,3 +9391,59 @@ int ndb_socialgraph_follower_count(struct ndb_txn *txn, struct ndb *ndb,
 {
 	return ndb_sg_follower_count(txn->mdb_txn, &ndb->socialgraph, pubkey);
 }
+<<<<<<< HEAD
+=======
+
+void ndb_socialgraph_set_root(struct ndb *ndb, const unsigned char *root_pubkey)
+{
+	// Queue a message to the writer thread to update root
+	// This ensures it's done within a write transaction
+	struct ndb_writer_msg msg = {
+		.type = NDB_WRITER_SET_ROOT
+	};
+	memcpy(msg.set_root.pubkey, root_pubkey, 32);
+	ndb_writer_queue_msg(&ndb->writer, &msg);
+}
+
+int ndb_socialgraph_is_muting(struct ndb_txn *txn, struct ndb *ndb,
+                               const unsigned char *muter_pubkey,
+                               const unsigned char *muted_pubkey)
+{
+	return ndb_sg_is_muting(txn->mdb_txn, &ndb->socialgraph,
+	                        muter_pubkey, muted_pubkey);
+}
+
+int ndb_socialgraph_get_muted(struct ndb_txn *txn, struct ndb *ndb,
+                               const unsigned char *pubkey,
+                               unsigned char *muted_out, int max_out)
+{
+	return ndb_sg_get_muted(txn->mdb_txn, &ndb->socialgraph,
+	                        pubkey, muted_out, max_out);
+}
+
+int ndb_socialgraph_get_muters(struct ndb_txn *txn, struct ndb *ndb,
+                                const unsigned char *pubkey,
+                                unsigned char *muters_out, int max_out)
+{
+	return ndb_sg_get_muters(txn->mdb_txn, &ndb->socialgraph,
+	                         pubkey, muters_out, max_out);
+}
+
+int ndb_socialgraph_followed_count(struct ndb_txn *txn, struct ndb *ndb,
+                                    const unsigned char *pubkey)
+{
+	return ndb_sg_followed_count(txn->mdb_txn, &ndb->socialgraph, pubkey);
+}
+
+int ndb_socialgraph_muter_count(struct ndb_txn *txn, struct ndb *ndb,
+                                 const unsigned char *pubkey)
+{
+	return ndb_sg_muter_count(txn->mdb_txn, &ndb->socialgraph, pubkey);
+}
+
+int ndb_uid_exists(struct ndb_txn *txn, struct ndb *ndb,
+                   const unsigned char *pubkey)
+{
+	return ndb_uid_exists_map(txn->mdb_txn, &ndb->socialgraph.uid_map, pubkey);
+}
+>>>>>>> master

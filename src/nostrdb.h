@@ -640,6 +640,88 @@ int ndb_socialgraph_get_followers(struct ndb_txn *txn, struct ndb *ndb,
 int ndb_socialgraph_follower_count(struct ndb_txn *txn, struct ndb *ndb,
                                     const unsigned char *pubkey);
 
+<<<<<<< HEAD
+=======
+/**
+ * Get followed count for a user (how many users they follow)
+ * @param txn Active transaction
+ * @param ndb Database handle
+ * @param pubkey 32-byte pubkey
+ * @return Number of users they follow
+ */
+int ndb_socialgraph_followed_count(struct ndb_txn *txn, struct ndb *ndb,
+                                    const unsigned char *pubkey);
+
+/**
+ * Set the root user for follow distance calculations
+ * Recalculates all distances from the new root if changed
+ * NOTE: This requires a write transaction and should only be called
+ * from the writer thread. For application use, consider calling during
+ * initialization or account switching in a deferred manner.
+ * @param ndb Database handle
+ * @param root_pubkey 32-byte root user pubkey
+ */
+void ndb_socialgraph_set_root(struct ndb *ndb, const unsigned char *root_pubkey);
+
+/**
+ * Check if one user mutes another
+ * @param txn Active transaction
+ * @param ndb Database handle
+ * @param muter_pubkey 32-byte muter pubkey
+ * @param muted_pubkey 32-byte muted pubkey
+ * @return 1 if muting, 0 otherwise
+ */
+int ndb_socialgraph_is_muting(struct ndb_txn *txn, struct ndb *ndb,
+                               const unsigned char *muter_pubkey,
+                               const unsigned char *muted_pubkey);
+
+/**
+ * Get list of users muted by a user
+ * @param txn Active transaction
+ * @param ndb Database handle
+ * @param pubkey 32-byte pubkey
+ * @param muted_out Output array of 32-byte pubkeys (caller allocates)
+ * @param max_out Maximum number of entries in output array
+ * @return Number of muted users written to output (may be less than actual count)
+ */
+int ndb_socialgraph_get_muted(struct ndb_txn *txn, struct ndb *ndb,
+                               const unsigned char *pubkey,
+                               unsigned char *muted_out, int max_out);
+
+/**
+ * Get list of users who mute this user
+ * @param txn Active transaction
+ * @param ndb Database handle
+ * @param pubkey 32-byte pubkey
+ * @param muters_out Output array of 32-byte pubkeys (caller allocates)
+ * @param max_out Maximum number of entries in output array
+ * @return Number of muters written to output (may be less than actual count)
+ */
+int ndb_socialgraph_get_muters(struct ndb_txn *txn, struct ndb *ndb,
+                                const unsigned char *pubkey,
+                                unsigned char *muters_out, int max_out);
+
+/**
+ * Get muter count for a user (how many users mute this user)
+ * @param txn Active transaction
+ * @param ndb Database handle
+ * @param pubkey 32-byte pubkey
+ * @return Number of users muting this user
+ */
+int ndb_socialgraph_muter_count(struct ndb_txn *txn, struct ndb *ndb,
+                                 const unsigned char *pubkey);
+
+/**
+ * Check if a UID exists for a pubkey (has user been seen before)
+ * @param txn Active transaction
+ * @param ndb Database handle
+ * @param pubkey 32-byte pubkey
+ * @return 1 if user has been seen, 0 if not
+ */
+int ndb_uid_exists(struct ndb_txn *txn, struct ndb *ndb,
+                   const unsigned char *pubkey);
+
+>>>>>>> master
 // BUILDER
 int ndb_parse_json_note(struct ndb_json_parser *, struct ndb_note **);
 int ndb_client_event_from_json(const char *json, int len, struct ndb_fce *fce, unsigned char *buf, int bufsize, struct ndb_id_cb *cb);
