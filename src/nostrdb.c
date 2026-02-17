@@ -4111,6 +4111,87 @@ static int ndb_write_reaction_stats(struct ndb_txn *txn, struct ndb_note *note,
 	       ndb_increment_total_reactions(txn, liked, scratch, scratch_size);
 }
 
+static struct ndb_str ndb_note_find_tag_str(struct ndb_note *note,
+					    const char *tag_name);
+
+// Parse bolt11 tag from a kind-9735 zap receipt and extract msats.
+// Returns 1 on success, 0 on failure. Sets *msats to 0 if amount unspecified.
+static int ndb_parse_zap_bolt11(struct ndb_note *note, uint64_t *msats)
+{
+	struct ndb_str bolt11_str;
+	struct bolt11 *inv;
+	char *fail;
+
+	bolt11_str = ndb_note_find_tag_str(note, "bolt11");
+	if (bolt11_str.str == NULL || bolt11_str.flag == NDB_PACKED_ID)
+		return 0;
+
+	inv = bolt11_decode_minimal(NULL, bolt11_str.str, &fail);
+	if (inv == NULL)
+		return 0;
+
+	*msats = (inv->msat != NULL) ? inv->msat->millisatoshis : 0;
+	tal_free(inv);
+	return 1;
+}
+
+// When receiving a kind-9735 zap receipt, parse the bolt11 tag and update
+// unverified zap counters on the zapped note's metadata
+static int ndb_write_unverified_zap_stats(struct ndb_txn *txn,
+					  struct ndb_note *note,
+					  unsigned char *scratch,
+					  size_t scratch_size)
+{
+	int rc;
+	uint32_t *count;
+	uint64_t *total;
+	uint64_t msats;
+	MDB_val key, val;
+	unsigned char *zapped_id;
+	struct ndb_note_meta *meta;
+	struct ndb_note_meta_entry *entry;
+	enum ndb_meta_clone_result cres;
+
+	zapped_id = ndb_note_last_id_tag(note, 'e');
+	if (zapped_id == NULL)
+		return 0;
+
+	if (!ndb_parse_zap_bolt11(note, &msats))
+		return 0;
+
+	meta = ndb_get_note_meta(txn, zapped_id);
+
+	cres = ndb_note_meta_clone_with_entry(&meta, &entry,
+		NDB_NOTE_META_ZAP_UNVERIFIED, NULL, scratch, scratch_size);
+
+	switch (cres) {
+	case NDB_META_CLONE_FAILED:
+		return 0;
+	case NDB_META_CLONE_NEW_ENTRY:
+		ndb_note_meta_zap_unverified_set(entry, 1, msats);
+		break;
+	case NDB_META_CLONE_EXISTING_ENTRY:
+		count = ndb_note_meta_zap_unverified_count(entry);
+		total = ndb_note_meta_zap_unverified_msats(entry);
+		(*count)++;
+		*total += msats;
+		break;
+	}
+
+	key.mv_data = zapped_id;
+	key.mv_size = 32;
+
+	val.mv_data = meta;
+	val.mv_size = ndb_note_meta_total_size(meta);
+	assert((val.mv_size % 8) == 0);
+
+	if ((rc = mdb_put(txn->mdb_txn, txn->lmdb->dbs[NDB_DB_META], &key, &val, 0))) {
+		ndb_debug("write unverified zap stats to db failed: %s\n", mdb_strerror(rc));
+		return 0;
+	}
+
+	return 1;
+}
 
 // Find the first tag matching a multi-char name (e.g. "bolt11") and return
 // its value (element at index 1) as an ndb_str
@@ -6560,6 +6641,8 @@ static uint64_t ndb_write_note(secp256k1_context *secp,
 		ndb_write_reaction_stats(txn, note->note, scratch, scratch_size);
 	} else if (kind == 6 || kind == 16) {
 		ndb_process_repost_stats(txn, note->note, scratch, scratch_size);
+	} else if (kind == 9735 && !ndb_flag_set(ndb_flags, NDB_FLAG_NO_STATS)) {
+		ndb_write_unverified_zap_stats(txn, note->note, scratch, scratch_size);
 	}
 
 	return note_key;
@@ -8075,9 +8158,6 @@ int ndb_verify_zap(struct ndb *ndb, struct ndb_txn *txn,
 	uint64_t *flags;
 	uint64_t msats;
 	unsigned char *zapped_id;
-	struct ndb_str bolt11_str;
-	struct bolt11 *inv;
-	char *fail;
 	size_t meta_size;
 
 	note = ndb_get_note_by_id(txn, zap_note_id, NULL, NULL);
@@ -8092,17 +8172,8 @@ int ndb_verify_zap(struct ndb *ndb, struct ndb_txn *txn,
 			return 1; // already verified, idempotent
 	}
 
-	// find bolt11 tag and parse amount
-	bolt11_str = ndb_note_find_tag_str(note, "bolt11");
-	if (bolt11_str.str == NULL || bolt11_str.flag == NDB_PACKED_ID)
+	if (!ndb_parse_zap_bolt11(note, &msats))
 		return 0;
-
-	inv = bolt11_decode_minimal(NULL, bolt11_str.str, &fail);
-	if (inv == NULL)
-		return 0;
-
-	msats = (inv->msat != NULL) ? inv->msat->millisatoshis : 0;
-	tal_free(inv);
 
 	// find zapped note (e tag)
 	zapped_id = ndb_note_last_id_tag(note, 'e');
@@ -8110,11 +8181,13 @@ int ndb_verify_zap(struct ndb *ndb, struct ndb_txn *txn,
 	// update zap stats on the zapped note if we have an e tag
 	if (zapped_id != NULL) {
 		unsigned char scratch[4096];
+		struct ndb_note_meta_entry *entry;
+		int rc;
+
 		target_meta = ndb_get_note_meta(txn, zapped_id);
 
-		// build updated target metadata in scratch buffer
-		struct ndb_note_meta_entry *entry;
-		int rc = ndb_note_meta_clone_with_entry(&target_meta, &entry,
+		// increment verified zap count
+		rc = ndb_note_meta_clone_with_entry(&target_meta, &entry,
 			NDB_NOTE_META_ZAP, NULL, scratch, sizeof(scratch));
 
 		switch (rc) {
@@ -8132,7 +8205,23 @@ int ndb_verify_zap(struct ndb *ndb, struct ndb_txn *txn,
 		}
 		}
 
+		// decrement unverified zap count (move from unverified to verified)
 		if (rc != NDB_META_CLONE_FAILED) {
+			rc = ndb_note_meta_clone_with_entry(&target_meta, &entry,
+				NDB_NOTE_META_ZAP_UNVERIFIED, NULL,
+				scratch, sizeof(scratch));
+
+			if (rc == NDB_META_CLONE_EXISTING_ENTRY) {
+				uint32_t *count = ndb_note_meta_zap_unverified_count(entry);
+				uint64_t *total = ndb_note_meta_zap_unverified_msats(entry);
+				if (*count > 0)
+					(*count)--;
+				if (*total >= msats)
+					*total -= msats;
+				else
+					*total = 0;
+			}
+
 			meta_size = ndb_note_meta_total_size(target_meta);
 			struct ndb_note_meta *heap_meta = malloc(meta_size);
 			if (heap_meta) {

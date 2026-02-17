@@ -752,16 +752,7 @@ static void test_zap_verification()
 	ndb_unsubscribe(ndb, subid);
 	ndb_filter_destroy(&filter);
 
-	// verify the zap
-	ndb_begin_query(ndb, &txn);
-	ok = ndb_verify_zap(ndb, &txn, zap_id);
-	assert(ok);
-	ndb_end_query(&txn);
-
-	// wait for writer to process the metadata updates
-	//usleep(100000);
-
-	// check zap stats on the target note
+	// check unverified zap stats written at ingestion time
 	ndb_begin_query(ndb, &txn);
 	{
 		struct ndb_note_meta *meta;
@@ -769,10 +760,44 @@ static void test_zap_verification()
 
 		meta = ndb_get_note_meta(&txn, target_id);
 		assert(meta);
+		entry = ndb_note_meta_find_entry(meta, NDB_NOTE_META_ZAP_UNVERIFIED, NULL);
+		assert(entry);
+		assert(*ndb_note_meta_zap_unverified_count(entry) == 1);
+		assert(*ndb_note_meta_zap_unverified_msats(entry) > 0);
+
+		// no verified zaps yet
+		entry = ndb_note_meta_find_entry(meta, NDB_NOTE_META_ZAP, NULL);
+		assert(entry == NULL);
+	}
+	ndb_end_query(&txn);
+
+	// verify the zap
+	ndb_begin_query(ndb, &txn);
+	ok = ndb_verify_zap(ndb, &txn, zap_id);
+	assert(ok);
+	ndb_end_query(&txn);
+
+	// wait for writer to process the metadata updates
+	usleep(100000);
+
+	// check: verified count=1, unverified count=0
+	ndb_begin_query(ndb, &txn);
+	{
+		struct ndb_note_meta *meta;
+		struct ndb_note_meta_entry *entry;
+
+		meta = ndb_get_note_meta(&txn, target_id);
+		assert(meta);
+
 		entry = ndb_note_meta_find_entry(meta, NDB_NOTE_META_ZAP, NULL);
 		assert(entry);
 		assert(*ndb_note_meta_zap_count(entry) == 1);
 		assert(*ndb_note_meta_zap_msats(entry) > 0);
+
+		entry = ndb_note_meta_find_entry(meta, NDB_NOTE_META_ZAP_UNVERIFIED, NULL);
+		assert(entry);
+		assert(*ndb_note_meta_zap_unverified_count(entry) == 0);
+		assert(*ndb_note_meta_zap_unverified_msats(entry) == 0);
 	}
 	ndb_end_query(&txn);
 

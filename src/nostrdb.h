@@ -56,6 +56,7 @@ enum ndb_metadata_type {
 	NDB_NOTE_META_COUNTS   = 100, /* replies, quotes, etc */
 	NDB_NOTE_META_REACTION = 200, /* count of all the reactions on a post, grouped by different reaction strings */
 	NDB_NOTE_META_ZAP      = 300, /* verified zap count and total msats */
+	NDB_NOTE_META_ZAP_UNVERIFIED = 302, /* unverified zap count and total msats */
 };
 
 #include "nip44.h"
@@ -740,6 +741,9 @@ void ndb_note_meta_reaction_set(struct ndb_note_meta_entry *entry, uint32_t coun
 uint32_t *ndb_note_meta_zap_count(struct ndb_note_meta_entry *entry);
 uint64_t *ndb_note_meta_zap_msats(struct ndb_note_meta_entry *entry);
 void ndb_note_meta_zap_set(struct ndb_note_meta_entry *entry, uint32_t count, uint64_t msats);
+uint32_t *ndb_note_meta_zap_unverified_count(struct ndb_note_meta_entry *entry);
+uint64_t *ndb_note_meta_zap_unverified_msats(struct ndb_note_meta_entry *entry);
+void ndb_note_meta_zap_unverified_set(struct ndb_note_meta_entry *entry, uint32_t count, uint64_t msats);
 void print_note_meta(struct ndb_note_meta *meta);
 
 // META STRINGS
