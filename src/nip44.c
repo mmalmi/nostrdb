@@ -272,6 +272,46 @@ const char *nip44_err_msg(enum ndb_decrypt_result res)
 	return "unknown";
 }
 
+/* Decrypt a NIP-44 payload using a pre-computed conversation key.
+ * This is the core decryption routine shared by both ECDH-based and
+ * symmetric-key (PNS) decryption paths.
+ */
+static enum ndb_decrypt_result
+nip44_decrypt_with_conversation_key(const unsigned char *conversation_key,
+				    struct nip44_payload *decoded,
+				    unsigned char **decrypted,
+				    uint16_t *decrypted_len)
+{
+	struct hmac_sha256 calculated_mac;
+	struct message_keys keys;
+
+	assert(sizeof(keys) == 76);
+
+	hkdf_expand(&keys, sizeof(keys),
+		    conversation_key, 32,
+		    decoded->nonce, 32);
+
+	hmac_aad(&calculated_mac, keys.auth, decoded->nonce,
+		 decoded->ciphertext, decoded->ciphertext_len);
+
+	if (memcmp(calculated_mac.sha.u.u8, decoded->mac, 32)) {
+		return NIP44_ERR_INVALID_MAC;
+	}
+
+	crypto_stream_chacha20_ietf_xor_ic(decoded->ciphertext,
+					   decoded->ciphertext,
+					   decoded->ciphertext_len,
+					   keys.nonce, 0, keys.key);
+
+	if (!unpad(decoded->ciphertext, decoded->ciphertext_len, decrypted_len)) {
+		return NIP44_ERR_INVALID_PADDING;
+	}
+
+	*decrypted = decoded->ciphertext + 2;
+
+	return NIP44_OK;
+}
+
 /* ### Decryption
  * Before decryption, the event's pubkey and signature MUST be validated as
  * defined in NIP 01. The public key MUST be a valid non-zero secp256k1 curve
@@ -286,10 +326,8 @@ nip44_decrypt_raw(void *secp,
 	      unsigned char **decrypted, uint16_t *decrypted_len)
 {
 	struct hmac_sha256 conversation_key;
-	struct hmac_sha256 calculated_mac;
 	enum ndb_decrypt_result rc;
 	unsigned char shared_secret[32];
-	struct message_keys keys;
 	secp256k1_context *context = (secp256k1_context *)secp;
 
 	/*
@@ -308,58 +346,30 @@ nip44_decrypt_raw(void *secp,
 
 	hmac_sha256(&conversation_key, "nip44-v2", 8, shared_secret, 32);
 
-	/*
-	5. Calculate message keys
-	   - The keys are generated from `conversation_key` and `nonce`.
-	     Validate that both are 32 bytes long
-	   - Use HKDF-expand, with sha256, `PRK=conversation_key`,
-	                                   `info=nonce` and `L=76`
-	   - Slice 76-byte HKDF output into: `chacha_key` (bytes 0..32),
-	     `chacha_nonce` (bytes 32..44), `hmac_key` (bytes 44..76)
-	*/
-	assert(sizeof(keys) == 76);
-	assert(sizeof(conversation_key) == 32);
+	return nip44_decrypt_with_conversation_key(
+		conversation_key.sha.u.u8, decoded, decrypted, decrypted_len);
+}
 
-	hkdf_expand(&keys, sizeof(keys),
-		    &conversation_key, sizeof(conversation_key),
-		    decoded->nonce, 32);
+/* Decrypt a NIP-44 payload using a pre-computed conversation key.
+ * Used by PNS (NIP-1080) where the conversation key is derived via HKDF
+ * from the device secret key, bypassing ECDH.
+ */
+enum ndb_decrypt_result
+nip44_decrypt_with_key(const unsigned char *conversation_key,
+		       const char *payload, size_t payload_len,
+		       unsigned char *buf, size_t bufsize,
+		       unsigned char **decrypted, uint16_t *decrypted_len)
+{
+	struct nip44_payload decoded;
+	enum ndb_decrypt_result rc;
 
-	/*
-	6. Calculate MAC (message authentication code) with AAD and compare
-	   - Stop and throw an error if MAC doesn't match the decoded one from
-	     step 2
-	   - Use constant-time comparison algorithm
-	*/
-	hmac_aad(&calculated_mac, keys.auth, decoded->nonce,
-		 decoded->ciphertext, decoded->ciphertext_len);
-
-	/* TODO(jb55): spec says this needs to be constant time memcmp,
-	 *             not sure why?
-	 */
-	if (memcmp(calculated_mac.sha.u.u8, decoded->mac, 32)) {
-		return NIP44_ERR_INVALID_MAC;
+	if ((rc = nip44_decode_payload(&decoded, buf, bufsize,
+				       payload, payload_len))) {
+		return rc;
 	}
 
-
-	/*
-	6. Decrypt ciphertext
-	   - Use ChaCha20 with key and nonce from step 3
-	*/
-	crypto_stream_chacha20_ietf_xor_ic(decoded->ciphertext,
-					   decoded->ciphertext,
-					   decoded->ciphertext_len,
-					   keys.nonce, 0, keys.key);
-
-	/*
-	7. Remove padding
-	*/
-	if (!unpad(decoded->ciphertext, decoded->ciphertext_len, decrypted_len)) {
-		return NIP44_ERR_INVALID_PADDING;
-	}
-
-	*decrypted = decoded->ciphertext + 2;
-
-	return NIP44_OK;
+	return nip44_decrypt_with_conversation_key(
+		conversation_key, &decoded, decrypted, decrypted_len);
 }
 
 enum ndb_decrypt_result
@@ -497,6 +507,67 @@ nip44_encrypt(void *secp, const unsigned char *sender_seckey,
 	7. Base64-encode (with padding) params using `concat(version, nonce,
 	ciphertext, mac)`
 	*/
+	*out = (char*)cursor.p;
+	*out_len = base64_encode((char*)cursor.p,
+				 cursor_remaining_capacity(&cursor),
+				 (const char*)cursor.start,
+				 cursor.p - cursor.start);
+
+	if (*out_len == -1)
+		return NIP44_ERR_BUFFER_TOO_SMALL;
+	return NIP44_OK;
+}
+
+/* Encrypt using a pre-computed conversation key (no ECDH).
+ * Used by PNS (NIP-1080) where the key is derived via HKDF. */
+enum ndb_decrypt_result
+nip44_encrypt_with_key(const unsigned char *conversation_key,
+		       const unsigned char *plaintext, uint16_t plaintext_size,
+		       unsigned char *buf, size_t bufsize,
+		       char **out, ssize_t *out_len)
+{
+	struct cursor cursor;
+	struct hmac_sha256 auth;
+	unsigned char nonce[32];
+	unsigned char *ciphertext;
+	struct message_keys keys;
+	uint16_t ciphertext_len;
+
+	make_cursor(buf, buf+bufsize, &cursor);
+
+	if (!fill_random(nonce, sizeof(nonce)))
+		return NIP44_ERR_FILL_RANDOM_FAILED;
+
+	hkdf_expand(&keys, sizeof(keys),
+		    conversation_key, 32,
+		    nonce, 32);
+
+	if (!cursor_push_byte(&cursor, 0x02))
+		return NIP44_ERR_BUFFER_TOO_SMALL;
+	if (!cursor_push(&cursor, nonce, 32))
+		return NIP44_ERR_BUFFER_TOO_SMALL;
+
+	ciphertext = cursor.p;
+
+	if (!cursor_push_b16(&cursor, plaintext_size))
+		return NIP44_ERR_BUFFER_TOO_SMALL;
+	if (!cursor_push(&cursor, (unsigned char*)plaintext, plaintext_size))
+		return NIP44_ERR_BUFFER_TOO_SMALL;
+	if (!cursor_memset(&cursor, 0,
+			   calc_padded_len(plaintext_size) - plaintext_size))
+		return NIP44_ERR_BUFFER_TOO_SMALL;
+
+	ciphertext_len = cursor.p - ciphertext;
+
+	crypto_stream_chacha20_ietf_xor_ic(ciphertext, ciphertext,
+					   ciphertext_len, keys.nonce, 0,
+					   keys.key);
+
+	hmac_aad(&auth, keys.auth, nonce, ciphertext, ciphertext_len);
+
+	if (!cursor_push(&cursor, auth.sha.u.u8, 32))
+		return NIP44_ERR_BUFFER_TOO_SMALL;
+
 	*out = (char*)cursor.p;
 	*out_len = base64_encode((char*)cursor.p,
 				 cursor_remaining_capacity(&cursor),

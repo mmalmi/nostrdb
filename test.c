@@ -537,6 +537,149 @@ static void test_giftwrap_unwrap()
 	printf("ok test_giftwrap_unwrap\n");
 }
 
+static void test_pns_unwrap()
+{
+	struct ndb *ndb;
+	struct ndb_filter filter;
+	struct ndb_config config;
+	struct ndb_txn txn;
+	struct ndb_note *inner, *pns_note;
+	int ok;
+	uint64_t subid;
+	ndb_default_config(&config);
+	const char *pns_json;
+	uint64_t note_ids[2];
+
+	static unsigned char device_sec[32] = {
+		0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2
+	};
+
+	/* device pubkey for secret key 0x02 */
+	static const unsigned char device_pub[32] = {
+		0xc6, 0x04, 0x7f, 0x94, 0x41, 0xed, 0x7d, 0x6d, 0x30, 0x45,
+		0x40, 0x6e, 0x95, 0xc0, 0x7c, 0xd8, 0x5c, 0x77, 0x8e, 0x4b,
+		0x8c, 0xef, 0x3c, 0xa7, 0xab, 0xac, 0x09, 0xb9, 0x5c, 0x70,
+		0x9e, 0xe5
+	};
+
+	static const unsigned char pns_id[32] = {
+		0xbf, 0xcd, 0x0d, 0x41, 0x5e, 0xa1, 0xb4, 0x77, 0x2d, 0x07,
+		0x5d, 0xe9, 0xe8, 0xf9, 0x8a, 0xc5, 0xc2, 0x22, 0x4a, 0x9d,
+		0x25, 0x12, 0xa6, 0x8c, 0x98, 0x4c, 0x39, 0xe5, 0x94, 0xb4,
+		0x6b, 0x15
+	};
+
+	delete_test_db();
+	assert(ndb_init(&ndb, test_dir, &config));
+
+	/* add key before ingestion so it auto-unwraps */
+	ndb_add_key(ndb, device_sec);
+
+	/* subscribe for kind-1 notes (the inner event) */
+	kind_filter(&filter, 1);
+	subid = ndb_subscribe(ndb, &filter, 1);
+
+	pns_json = "{\"id\":\"bfcd0d415ea1b4772d075de9e8f98ac5c2224a9d2512a68c984c39e594b46b15\",\"pubkey\":\"fa22d53e9d38ca7af1e66dcf88f5fb2444368df6bd16580b5827c8cfbc622d4e\",\"created_at\":1700000000,\"kind\":1080,\"tags\":[],\"content\":\"Ahtvtc5B/m/6n//vdOxtxR/+UbWx5qDP/teNxr563idfhMEObQ9v3Z1UI0HSyHWHCq2a9zwehpBYrJPXEnyvrzHeJQTQuz3AOKfJA/FT6MSMsGAyi197YDP3YaJfkDcdY0Aqnx5kXpir5IC95LCXjyPwDWms3ndJM3XksPLY0+mG8cYxdPkLxgnpqzs9N1pjf2ecPyvd8vx+3DVEY2APPalYE9L+rCYE5UyZzzDR2YD3MPF7wrb++wGeSL+46rvy2J/ZmUEnbXkC288MxTT77nSroiSB46PpcvbxBBqD82Q+I+G3Q3KWg16hn81MV2faXZ3rajZrZrXM+gs8kVunTGkH86KpAgt22RqdDcQiiogJoSL4k5cKzMGo268R+efqjZLt\",\"sig\":\"54f7ac921abdda5f14c045c2e3ba6f5cac1a41d8d46ffe370f1473f2b2dac938dc2801c818dc6916c6f1912a56c4ad327ed77f74a4acd85cf9ef209626a55616\"}";
+
+	ndb_process_event(ndb, pns_json, strlen(pns_json));
+
+	ok = ndb_wait_for_notes(ndb, subid, note_ids,
+				sizeof(note_ids)/sizeof(note_ids[0]));
+	assert(ok == 1);
+	assert(ndb_unsubscribe(ndb, subid));
+
+	ndb_begin_query(ndb, &txn);
+	inner = ndb_get_note_by_key(&txn, note_ids[0], NULL);
+	assert(inner);
+
+	assert(ndb_note_is_rumor(inner) == 1);
+	assert(ndb_note_kind(inner) == 1);
+	assert(!strcmp(ndb_note_content(inner), "hello from pns"));
+	assert(!memcmp(ndb_note_rumor_giftwrap_id(inner), pns_id, 32));
+	assert(!memcmp(ndb_note_rumor_receiver_pubkey(inner), device_pub, 32));
+	ndb_end_query(&txn);
+
+	/* verify the wrapper is marked as unwrapped */
+	ndb_begin_query(ndb, &txn);
+	pns_note = ndb_get_note_by_id(&txn, pns_id, NULL, NULL);
+	assert(pns_note);
+	assert(*ndb_note_flags(pns_note) & NDB_NOTE_FLAG_UNWRAPPED);
+	ndb_end_query(&txn);
+
+	ndb_filter_destroy(&filter);
+	ndb_destroy(ndb);
+	printf("ok test_pns_unwrap\n");
+}
+
+static void test_pns_reprocess()
+{
+	struct ndb *ndb;
+	struct ndb_filter filter;
+	struct ndb_config config;
+	struct ndb_txn txn;
+	struct ndb_note *inner;
+	int ok;
+	uint64_t subid;
+	ndb_default_config(&config);
+	const char *pns_json;
+	uint64_t note_ids[2];
+
+	static unsigned char device_sec[32] = {
+		0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2
+	};
+
+	static const unsigned char device_pub[32] = {
+		0xc6, 0x04, 0x7f, 0x94, 0x41, 0xed, 0x7d, 0x6d, 0x30, 0x45,
+		0x40, 0x6e, 0x95, 0xc0, 0x7c, 0xd8, 0x5c, 0x77, 0x8e, 0x4b,
+		0x8c, 0xef, 0x3c, 0xa7, 0xab, 0xac, 0x09, 0xb9, 0x5c, 0x70,
+		0x9e, 0xe5
+	};
+
+	delete_test_db();
+	assert(ndb_init(&ndb, test_dir, &config));
+
+	/* ingest PNS event BEFORE adding keys */
+	kind_filter(&filter, 1080);
+	subid = ndb_subscribe(ndb, &filter, 1);
+
+	pns_json = "{\"id\":\"bfcd0d415ea1b4772d075de9e8f98ac5c2224a9d2512a68c984c39e594b46b15\",\"pubkey\":\"fa22d53e9d38ca7af1e66dcf88f5fb2444368df6bd16580b5827c8cfbc622d4e\",\"created_at\":1700000000,\"kind\":1080,\"tags\":[],\"content\":\"Ahtvtc5B/m/6n//vdOxtxR/+UbWx5qDP/teNxr563idfhMEObQ9v3Z1UI0HSyHWHCq2a9zwehpBYrJPXEnyvrzHeJQTQuz3AOKfJA/FT6MSMsGAyi197YDP3YaJfkDcdY0Aqnx5kXpir5IC95LCXjyPwDWms3ndJM3XksPLY0+mG8cYxdPkLxgnpqzs9N1pjf2ecPyvd8vx+3DVEY2APPalYE9L+rCYE5UyZzzDR2YD3MPF7wrb++wGeSL+46rvy2J/ZmUEnbXkC288MxTT77nSroiSB46PpcvbxBBqD82Q+I+G3Q3KWg16hn81MV2faXZ3rajZrZrXM+gs8kVunTGkH86KpAgt22RqdDcQiiogJoSL4k5cKzMGo268R+efqjZLt\",\"sig\":\"54f7ac921abdda5f14c045c2e3ba6f5cac1a41d8d46ffe370f1473f2b2dac938dc2801c818dc6916c6f1912a56c4ad327ed77f74a4acd85cf9ef209626a55616\"}";
+
+	ndb_process_event(ndb, pns_json, strlen(pns_json));
+
+	ok = ndb_wait_for_notes(ndb, subid, note_ids,
+				sizeof(note_ids)/sizeof(note_ids[0]));
+	assert(ok == 1);
+	assert(ndb_unsubscribe(ndb, subid));
+
+	/* now add key and reprocess */
+	ndb_filter_destroy(&filter);
+	kind_filter(&filter, 1);
+	subid = ndb_subscribe(ndb, &filter, 1);
+
+	ndb_add_key(ndb, device_sec);
+	ndb_begin_query(ndb, &txn);
+	ndb_process_pns(ndb, &txn);
+	ndb_end_query(&txn);
+
+	ok = ndb_wait_for_notes(ndb, subid, note_ids,
+				sizeof(note_ids)/sizeof(note_ids[0]));
+	assert(ndb_unsubscribe(ndb, subid));
+
+	ndb_begin_query(ndb, &txn);
+	inner = ndb_get_note_by_key(&txn, note_ids[0], NULL);
+	assert(inner);
+
+	assert(ndb_note_is_rumor(inner) == 1);
+	assert(ndb_note_kind(inner) == 1);
+	assert(!strcmp(ndb_note_content(inner), "hello from pns"));
+	assert(!memcmp(ndb_note_rumor_receiver_pubkey(inner), device_pub, 32));
+	ndb_end_query(&txn);
+
+	ndb_filter_destroy(&filter);
+	ndb_destroy(ndb);
+	printf("ok test_pns_reprocess\n");
+}
+
 static void test_metadata()
 {
 	unsigned char buffer[1024];
@@ -2765,6 +2908,8 @@ int main(int argc, const char *argv[]) {
 
 	test_giftwrap_reprocess();
 	test_giftwrap_unwrap();
+	test_pns_unwrap();
+	test_pns_reprocess();
 	test_nip44_round_trip();
 	test_nip44_test_vector();
 	test_nip44_decrypt();

@@ -10,6 +10,7 @@
 #include "lmdb.h"
 #include "metadata.h"
 #include "nip44.h"
+#include "hmac_sha256.h"
 #include "util.h"
 #include "cpu.h"
 #include "block.h"
@@ -72,6 +73,16 @@ struct keypair {
 	unsigned char pubkey[32];
 };
 
+/* PNS (NIP-1080) key used for decrypting private notification events.
+ * Unlike giftwrap keys, PNS uses a pre-derived symmetric conversation key
+ * instead of ECDH.
+ */
+struct pns_key {
+	unsigned char pubkey[32];        /* pns_pubkey: for matching kind-1080 events */
+	unsigned char nip44_key[32];     /* pns_nip44_key: NIP-44 conversation key */
+	unsigned char device_pubkey[32]; /* the real device pubkey (receiver) */
+};
+
 struct ndb_ingester *ingester;
 int ndb_process_giftwrap(secp256k1_context *secp,
 			 struct ndb_ingester *ingester,
@@ -79,6 +90,14 @@ int ndb_process_giftwrap(secp256k1_context *secp,
 			 struct keypair *keys, int nkeys,
 			 const char *relay,
 			 unsigned char *scratch, size_t scratch_size);
+
+static int ndb_process_pns_event(struct ndb_ingester *ingester,
+				 struct ndb_note *note,
+				 struct pns_key *pns_keys, int npns_keys,
+				 const char *relay,
+				 unsigned char *scratch, size_t scratch_size,
+				 struct keypair *keys, int nkeys,
+				 secp256k1_context *secp);
 
 typedef int (*ndb_migrate_fn)(struct ndb_txn *);
 typedef int (*ndb_word_parser_fn)(void *, const char *word, int word_len,
@@ -2689,7 +2708,8 @@ enum ndb_ingester_msgtype {
 	NDB_INGEST_EVENT, // write json to the ingester queue for processing
 	NDB_INGEST_QUIT,  // kill ingester thread immediately
 	NDB_INGEST_ADD_KEY, // add a key for monitoring encrypted data
-	NDB_INGEST_PROCESS_GIFTWRAP, // add a key for monitoring encrypted data
+	NDB_INGEST_PROCESS_GIFTWRAP, // reprocess unwrapped giftwraps
+	NDB_INGEST_PROCESS_PNS, // reprocess kind-1080 events
 };
 
 struct ndb_ingester_event {
@@ -2705,6 +2725,10 @@ struct ndb_ingester_add_key {
 
 struct ndb_ingester_process_giftwrap {
 	uint64_t giftwrap_key;
+};
+
+struct ndb_ingester_process_pns {
+	uint64_t note_key;
 };
 
 struct ndb_writer_note_relay {
@@ -2742,6 +2766,7 @@ struct ndb_ingester_msg {
 		struct ndb_ingester_event event;
 		struct ndb_ingester_add_key add_key;
 		struct ndb_ingester_process_giftwrap process_giftwrap;
+		struct ndb_ingester_process_pns process_pns;
 	};
 };
 
@@ -3351,7 +3376,8 @@ static int ndb_ingester_process_note(secp256k1_context *secp,
 				     unsigned char *scratch,
 				     size_t scratch_size,
 				     const char *relay,
-				     struct keypair *keys, int nkeys)
+				     struct keypair *keys, int nkeys,
+				     struct pns_key *pns_keys, int npns_keys)
 {
 	enum ndb_ingest_filter_action action;
 	struct ndb_ingest_meta meta;
@@ -3410,6 +3436,11 @@ static int ndb_ingester_process_note(secp256k1_context *secp,
 		ndb_debug("processing giftwrap\n");
 		ndb_process_giftwrap(secp, ingester, note, keys, nkeys, relay,
 				     scratch, scratch_size);
+	} else if (note->kind == 1080) {
+		ndb_debug("processing pns\n");
+		ndb_process_pns_event(ingester, note, pns_keys, npns_keys,
+				      relay, scratch, scratch_size,
+				      keys, nkeys, secp);
 	}
 
 	msg.type = NDB_WRITER_NOTE;
@@ -3486,6 +3517,7 @@ static int ndb_ingester_process_event(secp256k1_context *ctx,
 				      struct ndb_ingester_event *ev,
 				      unsigned char *scratch,
 				      struct keypair *keys, int nkeys,
+				      struct pns_key *pns_keys, int npns_keys,
 				      MDB_txn *read_txn)
 {
 	struct ndb_tce tce;
@@ -3564,7 +3596,8 @@ static int ndb_ingester_process_event(secp256k1_context *ctx,
 						       ingester,
 						       scratch,
 						       ingester->scratch_size,
-						       ev->relay, keys, nkeys)) {
+						       ev->relay, keys, nkeys,
+						       pns_keys, npns_keys)) {
 				ndb_debug("failed to process note\n");
 				goto cleanup;
 			} else {
@@ -3588,7 +3621,8 @@ static int ndb_ingester_process_event(secp256k1_context *ctx,
 						       ingester, scratch,
 						       ingester->scratch_size,
 						       ev->relay,
-						       keys, nkeys)) {
+						       keys, nkeys,
+						       pns_keys, npns_keys)) {
 				ndb_debug("failed to process note\n");
 				goto cleanup;
 			} else {
@@ -6576,7 +6610,8 @@ static int ndb_ingest_rumor(secp256k1_context *secp,
 	}
 	return ndb_ingester_process_note(secp, rumor_msg, rc, ingester,
 					 scratch+rc, scratch_size-rc,
-					 relay, keys, nkeys);
+					 relay, keys, nkeys,
+					 NULL, 0);
 }
 
 static int ndb_process_seal(secp256k1_context *secp,
@@ -6704,6 +6739,54 @@ int ndb_process_giftwraps(struct ndb *ndb, struct ndb_txn *txn)
 	return 0;
 }
 
+int ndb_process_pns(struct ndb *ndb, struct ndb_txn *txn)
+{
+	MDB_cursor *cur;
+	struct ndb_note *note;
+	uint64_t note_key;
+	struct ndb_ingester_msg msg;
+	struct ndb_u64_ts index_key, *ik;
+
+	MDB_val k, v;
+
+	if (mdb_cursor_open(txn->mdb_txn, txn->lmdb->dbs[NDB_DB_NOTE_KIND], &cur))
+		return 0;
+
+	ndb_u64_ts_init(&index_key, 1080, UINT64_MAX);
+
+	k.mv_data = &index_key;
+	k.mv_size = sizeof(index_key);
+
+	if (!ndb_cursor_start(cur, &k, &v)) {
+		mdb_cursor_close(cur);
+		return 0;
+	}
+
+	do {
+		ik = (struct ndb_u64_ts *)k.mv_data;
+		note_key = *(uint64_t*)v.mv_data;
+		if (ik->u64 != 1080)
+			break;
+
+		if (!(note = ndb_get_note_by_key(txn, note_key, NULL)))
+			continue;
+
+		if (*ndb_note_flags(note) & NDB_NOTE_FLAG_UNWRAPPED)
+			continue;
+
+		msg.type = NDB_INGEST_PROCESS_PNS;
+		msg.process_pns.note_key = note_key;
+
+		ndb_debug("dispatching process pns %ld\n", note_key);
+
+		mdb_cursor_close(cur);
+		return threadpool_dispatch(&ndb->ingester.tp, &msg);
+	} while (mdb_cursor_get(cur, &k, &v, MDB_PREV) == 0);
+
+	mdb_cursor_close(cur);
+	return 0;
+}
+
 int ndb_process_giftwrap(secp256k1_context *secp,
 			 struct ndb_ingester *ingester,
 			 struct ndb_note *giftwrap,
@@ -6778,6 +6861,138 @@ int ndb_process_giftwrap(secp256k1_context *secp,
 			*flags = *flags | NDB_NOTE_FLAG_UNWRAPPED;
 			return 1;
 		}
+	}
+
+	return 0;
+}
+
+/* Process a PNS (kind-1080) event. Unlike giftwrap which has 3 layers
+ * (giftwrap -> seal -> rumor), PNS is a single layer of NIP-44 decryption
+ * with a pre-derived symmetric key.
+ *
+ * 1. Match event.pubkey against registered pns_pubkeys
+ * 2. Decrypt event.content with the matching pns_nip44_key
+ * 3. Parse and ingest the inner event
+ */
+static int ndb_process_pns_event(struct ndb_ingester *ingester,
+				 struct ndb_note *note,
+				 struct pns_key *pns_keys, int npns_keys,
+				 const char *relay,
+				 unsigned char *scratch, size_t scratch_size,
+				 struct keypair *keys, int nkeys,
+				 secp256k1_context *secp)
+{
+	const char *payload;
+	unsigned char *sender_pubkey, *decrypted, *wrap_id;
+	enum ndb_decrypt_result rc;
+	uint16_t decrypted_len, *flags;
+	size_t payload_len;
+	struct pns_key *pk;
+	int i, note_size, parse_cond;
+	struct ndb_note *inner;
+	void *inner_msg;
+	unsigned char *inner_scratch;
+	size_t inner_scratch_size;
+
+	wrap_id = ndb_note_id(note);
+	payload = ndb_note_content(note);
+	sender_pubkey = ndb_note_pubkey(note);
+	payload_len = ndb_note_content_length(note);
+
+	for (i = 0; i < npns_keys; i++) {
+		pk = &pns_keys[i];
+
+		/* match by pns_pubkey */
+		if (memcmp(sender_pubkey, pk->pubkey, 32) != 0)
+			continue;
+
+		/* decrypt using the pre-derived NIP-44 conversation key */
+		rc = nip44_decrypt_with_key(pk->nip44_key,
+					    payload, payload_len,
+					    scratch, scratch_size,
+					    &decrypted, &decrypted_len);
+
+		if (rc != NIP44_OK) {
+			ndb_debug("pns nip44 decrypt failed: %s\n",
+				  nip44_err_msg(rc));
+			return 0;
+		}
+
+		/* advance scratch past decrypted data */
+		inner_scratch = decrypted + decrypted_len;
+		if (inner_scratch <= scratch)
+			return 0;
+		inner_scratch_size = scratch_size - (inner_scratch - scratch);
+
+		/* parse the inner event. PNS inner events may be
+		 * signed (full events) or unsigned (rumors). We
+		 * accept both but don't require sig/pubkey. */
+		parse_cond = NDB_PARSED_ALL &
+			     ~(NDB_PARSED_SIG | NDB_PARSED_PUBKEY);
+
+		note_size = ndb_note_from_json_custom(
+			(const char *)decrypted, decrypted_len,
+			&inner, inner_scratch, inner_scratch_size,
+			parse_cond);
+
+		if (!note_size) {
+			ndb_debug("failed to parse pns inner json\n");
+			return 0;
+		}
+
+		/* set pubkey on inner event: use the one from the
+		 * inner event if present, otherwise use the device
+		 * pubkey (PNS is self-to-self) */
+		{
+			unsigned char *inner_pubkey;
+			unsigned char zeros[32] = {0};
+			inner_pubkey = ndb_note_pubkey(inner);
+
+			if (memcmp(inner_pubkey, zeros, 32) == 0)
+				memcpy(inner_pubkey, pk->device_pubkey, 32);
+		}
+
+		/* store device pubkey (receiver) and wrapper id in
+		 * sig field, same pattern as giftwrap rumors */
+		{
+			unsigned char *sig = ndb_note_sig(inner);
+			memcpy(sig, pk->device_pubkey, 32);
+			memcpy(sig + 32, wrap_id, 32);
+		}
+
+		/* recalculate id */
+		if (!ndb_calculate_id(inner,
+				      inner_scratch + note_size,
+				      inner_scratch_size - note_size,
+				      ndb_note_id(inner)))
+			return 0;
+
+		flags = ndb_note_flags(inner);
+		*flags = *flags | NDB_NOTE_FLAG_RUMOR;
+
+		inner_msg = malloc(note_size);
+		memcpy(inner_msg, inner, note_size);
+
+		if (relay != NULL) {
+			relay = strdup(relay);
+			if (relay == NULL)
+				return 0;
+		}
+
+		if (!ndb_ingester_process_note(secp, inner_msg, note_size,
+					       ingester,
+					       inner_scratch + note_size,
+					       inner_scratch_size - note_size,
+					       relay, keys, nkeys,
+					       pns_keys, npns_keys)) {
+			ndb_debug("failed to process pns inner note\n");
+			return 0;
+		}
+
+		/* mark the wrapper as unwrapped */
+		flags = ndb_note_flags(note);
+		*flags = *flags | NDB_NOTE_FLAG_UNWRAPPED;
+		return 1;
 	}
 
 	return 0;
@@ -7145,10 +7360,72 @@ static int ndb_ingester_add_keypair(secp256k1_context *ctx,
 	return 1;
 }
 
+/* Derive a PNS key from a device secret key:
+ *   pns_key      = HMAC-SHA256(key="nip-pns", msg=device_secret_key)
+ *   pns_nip44_key = HMAC-SHA256(key="nip44-v2", msg=pns_key)
+ *   pns_pubkey   = secp256k1_xonly_pubkey(pns_key)
+ */
+static int ndb_ingester_add_pns_key(secp256k1_context *ctx,
+				    unsigned char *seckey,
+				    struct pns_key *pns_keys, int *npns_keys)
+{
+	struct pns_key *pk;
+	struct hmac_sha256 pns_secret, pns_nip44;
+	int pk_parity = 0;
+	secp256k1_pubkey pubkey;
+	secp256k1_xonly_pubkey xonly_pubkey;
+
+	if (*npns_keys == MAX_INGESTER_KEYS)
+		return 0;
+
+	/* Derive device pubkey from the original secret key */
+	if (!secp256k1_ec_pubkey_create(ctx, &pubkey, seckey))
+		return 0;
+
+	if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &xonly_pubkey, &pk_parity,
+						&pubkey))
+		return 0;
+
+	pk = &pns_keys[*npns_keys];
+
+	if (!secp256k1_xonly_pubkey_serialize(ctx, pk->device_pubkey,
+					      &xonly_pubkey))
+		return 0;
+
+	/* pns_key = HKDF-Extract(salt="nip-pns", ikm=device_secret_key)
+	 *         = HMAC-SHA256(key="nip-pns", msg=device_secret_key) */
+	hmac_sha256(&pns_secret, "nip-pns", 7, seckey, 32);
+
+	/* Verify the derived key is a valid secp256k1 secret */
+	if (!secp256k1_ec_seckey_verify(ctx, pns_secret.sha.u.u8))
+		return 0;
+
+	/* pns_nip44_key = HKDF-Extract(salt="nip44-v2", ikm=pns_key)
+	 *              = HMAC-SHA256(key="nip44-v2", msg=pns_key) */
+	hmac_sha256(&pns_nip44, "nip44-v2", 8, pns_secret.sha.u.u8, 32);
+
+	memcpy(pk->nip44_key, pns_nip44.sha.u.u8, 32);
+
+	/* Derive pns_pubkey from pns_key */
+	if (!secp256k1_ec_pubkey_create(ctx, &pubkey, pns_secret.sha.u.u8))
+		return 0;
+
+	if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &xonly_pubkey, &pk_parity,
+						&pubkey))
+		return 0;
+
+	if (!secp256k1_xonly_pubkey_serialize(ctx, pk->pubkey, &xonly_pubkey))
+		return 0;
+
+	(*npns_keys)++;
+	return 1;
+}
+
 static const char *ndb_ingest_msg_name(enum ndb_ingester_msgtype type)
 {
 	switch (type) {
 	case NDB_INGEST_PROCESS_GIFTWRAP: return "process_giftwrap";
+	case NDB_INGEST_PROCESS_PNS: return "process_pns";
 	case NDB_INGEST_ADD_KEY: return "add_key";
 	case NDB_INGEST_QUIT: return "quit";
 	case NDB_INGEST_EVENT: return "event";
@@ -7194,6 +7471,42 @@ static int ndb_ingester_reprocess_giftwrap(
 	return 1;
 }
 
+/* reprocess a PNS event if we can */
+static int ndb_ingester_reprocess_pns(
+	secp256k1_context *secp,
+	struct ndb_ingester *ingester,
+	struct ndb_txn *txn,
+	struct ndb_ingester_process_pns *proc_pns,
+	unsigned char *scratch, size_t scratch_size,
+	struct pns_key *pns_keys, int npns_keys,
+	struct keypair *keys, int nkeys)
+{
+	struct ndb_note *note;
+	size_t note_size;
+	int rc;
+
+	note = ndb_get_note_by_key(txn, proc_pns->note_key, &note_size);
+	if (!note) {
+		ndb_debug("failed to find pns note with note_key %ld\n",
+			  proc_pns->note_key);
+		return 0;
+	}
+
+	memcpy(scratch, note, note_size);
+	note = (struct ndb_note *)scratch;
+
+	rc = ndb_process_pns_event(ingester, note, pns_keys, npns_keys, NULL,
+				   scratch + note_size, scratch_size - note_size,
+				   keys, nkeys, secp);
+	if (!rc) {
+		ndb_debug("failed to reprocess pns %ld\n", proc_pns->note_key);
+		return 0;
+	}
+
+	ndb_debug("reprocess pns %ld success\n", proc_pns->note_key);
+	return 1;
+}
+
 static void *ndb_ingester_thread(void *data)
 {
 	secp256k1_context *ctx;
@@ -7201,14 +7514,17 @@ static void *ndb_ingester_thread(void *data)
 	struct ndb_ingester *ingester = (struct ndb_ingester *)thread->ctx;
 	struct ndb_lmdb *lmdb = ingester->lmdb;
 	struct ndb_ingester_msg msgs[THREAD_QUEUE_BATCH], *msg;
-	int i, popped, done, any_event, rc, nkeys;
+	int i, popped, done, any_event, rc, nkeys, npns_keys;
 	MDB_txn *read_txn = NULL;
 	struct keypair *keys;
+	struct pns_key *pns_keys;
 	struct ndb_txn txn;
 	unsigned char *scratch;
 
 	nkeys = 0;
+	npns_keys = 0;
 	keys = malloc(sizeof(*keys) * MAX_INGESTER_KEYS);
+	pns_keys = malloc(sizeof(*pns_keys) * MAX_INGESTER_KEYS);
 
 	// this is used in note verification and anything else that
 	// needs a temporary buffer
@@ -7244,6 +7560,7 @@ static void *ndb_ingester_thread(void *data)
 			switch (msg->type) {
 			case NDB_INGEST_EVENT:
 			case NDB_INGEST_PROCESS_GIFTWRAP:
+			case NDB_INGEST_PROCESS_PNS:
 				any_event = 1;
 				break;
 			case NDB_INGEST_ADD_KEY:
@@ -7276,9 +7593,21 @@ static void *ndb_ingester_thread(void *data)
 					keys, nkeys);
 				break;
 
+			case NDB_INGEST_PROCESS_PNS:
+				ndb_txn_from_mdb(&txn, lmdb, read_txn);
+				ndb_ingester_reprocess_pns(
+					ctx, ingester, &txn,
+					&msg->process_pns,
+					scratch, ingester->scratch_size,
+					pns_keys, npns_keys,
+					keys, nkeys);
+				break;
+
 			case NDB_INGEST_ADD_KEY:
 				ndb_ingester_add_keypair(ctx, msg->add_key.key,
 							 keys, &nkeys);
+				ndb_ingester_add_pns_key(ctx, msg->add_key.key,
+							 pns_keys, &npns_keys);
 				break;
 
 			case NDB_INGEST_EVENT:
@@ -7286,6 +7615,7 @@ static void *ndb_ingester_thread(void *data)
 							   &msg->event,
 							   scratch,
 							   keys, nkeys,
+							   pns_keys, npns_keys,
 							   read_txn);
 				break;
 			}
@@ -7299,6 +7629,7 @@ static void *ndb_ingester_thread(void *data)
 	secp256k1_context_destroy(ctx);
 	free(scratch);
 	free(keys);
+	free(pns_keys);
 	return NULL;
 }
 

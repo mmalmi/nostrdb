@@ -52,6 +52,18 @@ nip44_decode_payload(struct nip44_payload *decoded,
 		     unsigned char *buf, size_t bufsize,
 		     const char *payload, size_t payload_len);
 
+enum ndb_decrypt_result
+nip44_decrypt_with_key(const unsigned char *conversation_key,
+		       const char *payload, size_t payload_len,
+		       unsigned char *buf, size_t bufsize,
+		       unsigned char **decrypted, uint16_t *decrypted_len);
+
+enum ndb_decrypt_result
+nip44_encrypt_with_key(const unsigned char *conversation_key,
+		       const unsigned char *plaintext, uint16_t plaintext_size,
+		       unsigned char *buf, size_t bufsize,
+		       char **out, ssize_t *out_len);
+
 const char *nip44_err_msg(enum ndb_decrypt_result res);
 
 #endif /* NDB_METADATA_H */
