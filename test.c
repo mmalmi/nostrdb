@@ -826,6 +826,172 @@ static void test_zap_verification()
 	printf("ok test_zap_verification\n");
 }
 
+static void test_multiple_zaps()
+{
+	struct ndb *ndb;
+	struct ndb_filter filter;
+	struct ndb_config config;
+	struct ndb_txn txn;
+	int ok;
+	uint64_t subid;
+	uint64_t note_ids[4];
+	ndb_default_config(&config);
+
+	const char *target_json =
+		"{\"id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
+		"\"pubkey\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\","
+		"\"created_at\":1700000000,\"kind\":1,\"tags\":[],\"content\":\"hello\","
+		"\"sig\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"}";
+
+	static const unsigned char target_id[32] = {
+		0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+		0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+		0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+		0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa
+	};
+
+	// two zap receipts with different ids, same bolt11 (123000 msats each)
+	const char *zap1_json =
+		"{\"id\":\"1111111111111111111111111111111111111111111111111111111111111111\","
+		"\"pubkey\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\","
+		"\"created_at\":1700000001,\"kind\":9735,"
+		"\"tags\":["
+		"[\"bolt11\",\"lnbc1230n1p5fetpfpp5mqn7v09jz8pkxl67h4hgd8z2xuqfzfhlw0d4yu5dz4z35ermszaqdq57z0cadhsn78tduylnztscqzzsxqyz5vqrzjqvueefmrckfdwyyu39m0lf24sqzcr9vcrmxrvgfn6empxz7phrjxvrttncqq0lcqqyqqqqlgqqqqqqgq2qsp5mhdv3kgh8y57hd0nezqk0yqhdtkjecnykfxer2k4geg7x34xvqyq9qxpqysgqylpwwyjlvfhc4jzw5hl77a5ajdf7ay6hku7vpznc9efe8nw0h2jp58p7hl2km3hsf3k40z6tey4ye26zf3wwt77ws02rdzzl3cem97squshha0\"],"
+		"[\"e\",\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"]"
+		"],\"content\":\"\","
+		"\"sig\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"}";
+
+	const char *zap2_json =
+		"{\"id\":\"2222222222222222222222222222222222222222222222222222222222222222\","
+		"\"pubkey\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\","
+		"\"created_at\":1700000002,\"kind\":9735,"
+		"\"tags\":["
+		"[\"bolt11\",\"lnbc1230n1p5fetpfpp5mqn7v09jz8pkxl67h4hgd8z2xuqfzfhlw0d4yu5dz4z35ermszaqdq57z0cadhsn78tduylnztscqzzsxqyz5vqrzjqvueefmrckfdwyyu39m0lf24sqzcr9vcrmxrvgfn6empxz7phrjxvrttncqq0lcqqyqqqqlgqqqqqqgq2qsp5mhdv3kgh8y57hd0nezqk0yqhdtkjecnykfxer2k4geg7x34xvqyq9qxpqysgqylpwwyjlvfhc4jzw5hl77a5ajdf7ay6hku7vpznc9efe8nw0h2jp58p7hl2km3hsf3k40z6tey4ye26zf3wwt77ws02rdzzl3cem97squshha0\"],"
+		"[\"e\",\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"]"
+		"],\"content\":\"\","
+		"\"sig\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"}";
+
+	static const unsigned char zap1_id[32] = {
+		0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
+		0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
+		0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
+		0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11
+	};
+
+	static const unsigned char zap2_id[32] = {
+		0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22,
+		0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22,
+		0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22,
+		0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22
+	};
+
+	ndb_config_set_flags(&config, NDB_FLAG_SKIP_NOTE_VERIFY);
+
+	delete_test_db();
+	assert(ndb_init(&ndb, test_dir, &config));
+
+	// ingest the target note
+	kind_filter(&filter, 1);
+	subid = ndb_subscribe(ndb, &filter, 1);
+	ndb_process_event(ndb, target_json, strlen(target_json));
+	ok = ndb_wait_for_notes(ndb, subid, note_ids, 4);
+	assert(ok >= 1);
+	ndb_unsubscribe(ndb, subid);
+	ndb_filter_destroy(&filter);
+
+	// ingest both zap receipts
+	kind_filter(&filter, 9735);
+	subid = ndb_subscribe(ndb, &filter, 1);
+	ndb_process_event(ndb, zap1_json, strlen(zap1_json));
+	ndb_process_event(ndb, zap2_json, strlen(zap2_json));
+	ok = ndb_wait_for_notes(ndb, subid, note_ids, 4);
+	assert(ok >= 1);
+	if (ok < 2)
+		ok += ndb_wait_for_notes(ndb, subid, note_ids, 4);
+	assert(ok >= 2);
+	ndb_unsubscribe(ndb, subid);
+	ndb_filter_destroy(&filter);
+
+	// check: unverified count=2, msats=246000 (123000 * 2)
+	ndb_begin_query(ndb, &txn);
+	{
+		struct ndb_note_meta *meta;
+		struct ndb_note_meta_entry *entry;
+
+		meta = ndb_get_note_meta(&txn, target_id);
+		assert(meta);
+		entry = ndb_note_meta_find_entry(meta, NDB_NOTE_META_ZAP_UNVERIFIED, NULL);
+		assert(entry);
+		assert(*ndb_note_meta_zap_unverified_count(entry) == 2);
+		assert(*ndb_note_meta_zap_unverified_msats(entry) == 246000);
+
+		entry = ndb_note_meta_find_entry(meta, NDB_NOTE_META_ZAP, NULL);
+		assert(entry == NULL);
+	}
+	ndb_end_query(&txn);
+
+	// verify only the first zap
+	ndb_begin_query(ndb, &txn);
+	ok = ndb_verify_zap(ndb, &txn, zap1_id);
+	assert(ok);
+	ndb_end_query(&txn);
+
+	usleep(100000);
+
+	// check: verified count=1/123000, unverified count=1/123000
+	ndb_begin_query(ndb, &txn);
+	{
+		struct ndb_note_meta *meta;
+		struct ndb_note_meta_entry *entry;
+
+		meta = ndb_get_note_meta(&txn, target_id);
+		assert(meta);
+
+		entry = ndb_note_meta_find_entry(meta, NDB_NOTE_META_ZAP, NULL);
+		assert(entry);
+		assert(*ndb_note_meta_zap_count(entry) == 1);
+		assert(*ndb_note_meta_zap_msats(entry) == 123000);
+
+		entry = ndb_note_meta_find_entry(meta, NDB_NOTE_META_ZAP_UNVERIFIED, NULL);
+		assert(entry);
+		assert(*ndb_note_meta_zap_unverified_count(entry) == 1);
+		assert(*ndb_note_meta_zap_unverified_msats(entry) == 123000);
+	}
+	ndb_end_query(&txn);
+
+	// verify the second zap
+	ndb_begin_query(ndb, &txn);
+	ok = ndb_verify_zap(ndb, &txn, zap2_id);
+	assert(ok);
+	ndb_end_query(&txn);
+
+	usleep(100000);
+
+	// check: verified count=2/246000, unverified count=0/0
+	ndb_begin_query(ndb, &txn);
+	{
+		struct ndb_note_meta *meta;
+		struct ndb_note_meta_entry *entry;
+
+		meta = ndb_get_note_meta(&txn, target_id);
+		assert(meta);
+
+		entry = ndb_note_meta_find_entry(meta, NDB_NOTE_META_ZAP, NULL);
+		assert(entry);
+		assert(*ndb_note_meta_zap_count(entry) == 2);
+		assert(*ndb_note_meta_zap_msats(entry) == 246000);
+
+		entry = ndb_note_meta_find_entry(meta, NDB_NOTE_META_ZAP_UNVERIFIED, NULL);
+		assert(entry);
+		assert(*ndb_note_meta_zap_unverified_count(entry) == 0);
+		assert(*ndb_note_meta_zap_unverified_msats(entry) == 0);
+	}
+	ndb_end_query(&txn);
+
+	ndb_destroy(ndb);
+	printf("ok test_multiple_zaps\n");
+}
+
 static void test_metadata()
 {
 	unsigned char buffer[1024];
@@ -3057,6 +3223,7 @@ int main(int argc, const char *argv[]) {
 	test_pns_unwrap();
 	test_pns_reprocess();
 	test_zap_verification();
+	test_multiple_zaps();
 	test_nip44_round_trip();
 	test_nip44_test_vector();
 	test_nip44_decrypt();
