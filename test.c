@@ -680,6 +680,127 @@ static void test_pns_reprocess()
 	printf("ok test_pns_reprocess\n");
 }
 
+static void test_zap_verification()
+{
+	struct ndb *ndb;
+	struct ndb_filter filter;
+	struct ndb_config config;
+	struct ndb_txn txn;
+	int ok;
+	uint64_t subid;
+	uint64_t note_ids[4];
+	ndb_default_config(&config);
+
+	// a kind-1 note that will be the zap target
+	// note id: aaaa...aaaa (we just need a valid event)
+	const char *target_json =
+		"{\"id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
+		"\"pubkey\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\","
+		"\"created_at\":1700000000,\"kind\":1,\"tags\":[],\"content\":\"hello world\","
+		"\"sig\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"}";
+
+	static const unsigned char target_id[32] = {
+		0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+		0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+		0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+		0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa
+	};
+
+	// a kind-9735 zap receipt with:
+	//   - bolt11 tag: lnbc1230n... (1230 nano-BTC = 123000 sats = 123000000 msats)
+	//   - e tag pointing to the target note
+	const char *zap_json =
+		"{\"id\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\","
+		"\"pubkey\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\","
+		"\"created_at\":1700000001,\"kind\":9735,"
+		"\"tags\":["
+		"[\"bolt11\",\"lnbc1230n1p5fetpfpp5mqn7v09jz8pkxl67h4hgd8z2xuqfzfhlw0d4yu5dz4z35ermszaqdq57z0cadhsn78tduylnztscqzzsxqyz5vqrzjqvueefmrckfdwyyu39m0lf24sqzcr9vcrmxrvgfn6empxz7phrjxvrttncqq0lcqqyqqqqlgqqqqqqgq2qsp5mhdv3kgh8y57hd0nezqk0yqhdtkjecnykfxer2k4geg7x34xvqyq9qxpqysgqylpwwyjlvfhc4jzw5hl77a5ajdf7ay6hku7vpznc9efe8nw0h2jp58p7hl2km3hsf3k40z6tey4ye26zf3wwt77ws02rdzzl3cem97squshha0\"],"
+		"[\"e\",\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"],"
+		"[\"p\",\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"]"
+		"],\"content\":\"\","
+		"\"sig\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"}";
+
+	static const unsigned char zap_id[32] = {
+		0xdd, 0xdd, 0xdd, 0xdd, 0xdd, 0xdd, 0xdd, 0xdd,
+		0xdd, 0xdd, 0xdd, 0xdd, 0xdd, 0xdd, 0xdd, 0xdd,
+		0xdd, 0xdd, 0xdd, 0xdd, 0xdd, 0xdd, 0xdd, 0xdd,
+		0xdd, 0xdd, 0xdd, 0xdd, 0xdd, 0xdd, 0xdd, 0xdd
+	};
+
+	ndb_config_set_flags(&config, NDB_FLAG_SKIP_NOTE_VERIFY);
+
+	delete_test_db();
+	assert(ndb_init(&ndb, test_dir, &config));
+
+	// subscribe for kind-1 and kind-9735
+	kind_filter(&filter, 1);
+	subid = ndb_subscribe(ndb, &filter, 1);
+
+	// ingest the target note first
+	ndb_process_event(ndb, target_json, strlen(target_json));
+	ok = ndb_wait_for_notes(ndb, subid, note_ids, 4);
+	assert(ok >= 1);
+	ndb_unsubscribe(ndb, subid);
+	ndb_filter_destroy(&filter);
+
+	// now ingest the zap receipt
+	kind_filter(&filter, 9735);
+	subid = ndb_subscribe(ndb, &filter, 1);
+	ndb_process_event(ndb, zap_json, strlen(zap_json));
+	ok = ndb_wait_for_notes(ndb, subid, note_ids, 4);
+	assert(ok >= 1);
+	ndb_unsubscribe(ndb, subid);
+	ndb_filter_destroy(&filter);
+
+	// verify the zap
+	ndb_begin_query(ndb, &txn);
+	ok = ndb_verify_zap(ndb, &txn, zap_id);
+	assert(ok);
+	ndb_end_query(&txn);
+
+	// wait for writer to process the metadata updates
+	//usleep(100000);
+
+	// check zap stats on the target note
+	ndb_begin_query(ndb, &txn);
+	{
+		struct ndb_note_meta *meta;
+		struct ndb_note_meta_entry *entry;
+
+		meta = ndb_get_note_meta(&txn, target_id);
+		assert(meta);
+		entry = ndb_note_meta_find_entry(meta, NDB_NOTE_META_ZAP, NULL);
+		assert(entry);
+		assert(*ndb_note_meta_zap_count(entry) == 1);
+		assert(*ndb_note_meta_zap_msats(entry) > 0);
+	}
+	ndb_end_query(&txn);
+
+	// test idempotency: verify again should not double-count
+	ndb_begin_query(ndb, &txn);
+	ok = ndb_verify_zap(ndb, &txn, zap_id);
+	assert(ok);
+	ndb_end_query(&txn);
+
+	usleep(100000);
+
+	ndb_begin_query(ndb, &txn);
+	{
+		struct ndb_note_meta *meta;
+		struct ndb_note_meta_entry *entry;
+
+		meta = ndb_get_note_meta(&txn, target_id);
+		assert(meta);
+		entry = ndb_note_meta_find_entry(meta, NDB_NOTE_META_ZAP, NULL);
+		assert(entry);
+		assert(*ndb_note_meta_zap_count(entry) == 1); // still 1, not 2
+	}
+	ndb_end_query(&txn);
+
+	ndb_destroy(ndb);
+	printf("ok test_zap_verification\n");
+}
+
 static void test_metadata()
 {
 	unsigned char buffer[1024];
@@ -2910,6 +3031,7 @@ int main(int argc, const char *argv[]) {
 	test_giftwrap_unwrap();
 	test_pns_unwrap();
 	test_pns_reprocess();
+	test_zap_verification();
 	test_nip44_round_trip();
 	test_nip44_test_vector();
 	test_nip44_decrypt();

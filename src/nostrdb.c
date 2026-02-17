@@ -4112,6 +4112,29 @@ static int ndb_write_reaction_stats(struct ndb_txn *txn, struct ndb_note *note,
 }
 
 
+// Find the first tag matching a multi-char name (e.g. "bolt11") and return
+// its value (element at index 1) as an ndb_str
+static struct ndb_str ndb_note_find_tag_str(struct ndb_note *note,
+					    const char *tag_name)
+{
+	struct ndb_iterator iter;
+	struct ndb_str str;
+	struct ndb_str empty = {0};
+
+	ndb_tags_iterate_start(note, &iter);
+
+	while (ndb_tags_iterate_next(&iter)) {
+		if (iter.tag->count < 2)
+			continue;
+
+		str = ndb_tag_str(note, iter.tag, 0);
+		if (str.flag != NDB_PACKED_ID && !strcmp(str.str, tag_name))
+			return ndb_tag_str(note, iter.tag, 1);
+	}
+
+	return empty;
+}
+
 static int ndb_write_note_id_index(struct ndb_txn *txn, struct ndb_note *note,
 				   uint64_t note_key)
 
@@ -7315,6 +7338,8 @@ static void *ndb_writer_thread(void *data)
 				ndb_blocks_free(msg->blocks.blocks);
 			} else if (msg->type == NDB_WRITER_NOTE_RELAY) {
 				free((void*)msg->note_relay.relay);
+			} else if (msg->type == NDB_WRITER_NOTE_META) {
+				free(msg->note_meta.metadata);
 			}
 		}
 	}
@@ -8039,6 +8064,113 @@ int ndb_process_event_with(struct ndb *ndb, const char *json, int json_len,
 			   struct ndb_ingest_meta *meta)
 {
 	return ndb_ingest_event(&ndb->ingester, json, json_len, meta);
+}
+
+int ndb_verify_zap(struct ndb *ndb, struct ndb_txn *txn,
+		   const unsigned char *zap_note_id)
+{
+	struct ndb_note *note;
+	struct ndb_note_meta *meta;
+	struct ndb_note_meta *zap_meta, *target_meta;
+	uint64_t *flags;
+	uint64_t msats;
+	unsigned char *zapped_id;
+	struct ndb_str bolt11_str;
+	struct bolt11 *inv;
+	char *fail;
+	size_t meta_size;
+
+	note = ndb_get_note_by_id(txn, zap_note_id, NULL, NULL);
+	if (note == NULL)
+		return 0;
+
+	// check if already verified
+	meta = ndb_get_note_meta(txn, zap_note_id);
+	if (meta != NULL) {
+		flags = ndb_note_meta_flags(meta);
+		if (*flags & NDB_NOTE_META_FLAG_ZAP_VERIFIED)
+			return 1; // already verified, idempotent
+	}
+
+	// find bolt11 tag and parse amount
+	bolt11_str = ndb_note_find_tag_str(note, "bolt11");
+	if (bolt11_str.str == NULL || bolt11_str.flag == NDB_PACKED_ID)
+		return 0;
+
+	inv = bolt11_decode_minimal(NULL, bolt11_str.str, &fail);
+	if (inv == NULL)
+		return 0;
+
+	msats = (inv->msat != NULL) ? inv->msat->millisatoshis : 0;
+	tal_free(inv);
+
+	// find zapped note (e tag)
+	zapped_id = ndb_note_last_id_tag(note, 'e');
+
+	// update zap stats on the zapped note if we have an e tag
+	if (zapped_id != NULL) {
+		unsigned char scratch[4096];
+		target_meta = ndb_get_note_meta(txn, zapped_id);
+
+		// build updated target metadata in scratch buffer
+		struct ndb_note_meta_entry *entry;
+		int rc = ndb_note_meta_clone_with_entry(&target_meta, &entry,
+			NDB_NOTE_META_ZAP, NULL, scratch, sizeof(scratch));
+
+		switch (rc) {
+		case NDB_META_CLONE_FAILED:
+			break;
+		case NDB_META_CLONE_NEW_ENTRY:
+			ndb_note_meta_zap_set(entry, 1, msats);
+			break;
+		case NDB_META_CLONE_EXISTING_ENTRY: {
+			uint32_t *count = ndb_note_meta_zap_count(entry);
+			uint64_t *total = ndb_note_meta_zap_msats(entry);
+			(*count)++;
+			*total += msats;
+			break;
+		}
+		}
+
+		if (rc != NDB_META_CLONE_FAILED) {
+			meta_size = ndb_note_meta_total_size(target_meta);
+			struct ndb_note_meta *heap_meta = malloc(meta_size);
+			if (heap_meta) {
+				memcpy(heap_meta, target_meta, meta_size);
+				ndb_set_note_meta(ndb, zapped_id, heap_meta);
+			}
+		}
+	}
+
+	// mark the zap receipt as verified
+	{
+		unsigned char scratch2[4096];
+		struct ndb_note_meta *receipt_meta = meta;
+
+		if (receipt_meta == NULL) {
+			struct ndb_note_meta_builder builder;
+			ndb_note_meta_builder_init(&builder, scratch2, sizeof(scratch2));
+			ndb_note_meta_build(&builder, &receipt_meta);
+		} else {
+			meta_size = ndb_note_meta_total_size(receipt_meta);
+			if (meta_size > sizeof(scratch2))
+				return 0;
+			memcpy(scratch2, receipt_meta, meta_size);
+			receipt_meta = (struct ndb_note_meta *)scratch2;
+		}
+
+		flags = ndb_note_meta_flags(receipt_meta);
+		*flags |= NDB_NOTE_META_FLAG_ZAP_VERIFIED;
+
+		meta_size = ndb_note_meta_total_size(receipt_meta);
+		zap_meta = malloc(meta_size);
+		if (zap_meta == NULL)
+			return 0;
+		memcpy(zap_meta, receipt_meta, meta_size);
+		ndb_set_note_meta(ndb, zap_note_id, zap_meta);
+	}
+
+	return 1;
 }
 
 int _ndb_process_events(struct ndb *ndb, const char *ldjson, size_t json_len,

@@ -55,6 +55,7 @@ enum ndb_metadata_type {
 	NDB_NOTE_META_RESERVED = 0, /* not used */
 	NDB_NOTE_META_COUNTS   = 100, /* replies, quotes, etc */
 	NDB_NOTE_META_REACTION = 200, /* count of all the reactions on a post, grouped by different reaction strings */
+	NDB_NOTE_META_ZAP      = 300, /* verified zap count and total msats */
 };
 
 #include "nip44.h"
@@ -609,6 +610,7 @@ int ndb_process_events(struct ndb *, const char *ldjson, size_t len);
 int ndb_process_giftwraps(struct ndb *, struct ndb_txn *);
 /* reprocess kind-1080 PNS events that arrived before keys were registered */
 int ndb_process_pns(struct ndb *, struct ndb_txn *);
+int ndb_verify_zap(struct ndb *ndb, struct ndb_txn *txn, const unsigned char *zap_note_id);
 int ndb_process_events_with(struct ndb *ndb, const char *ldjson, size_t json_len, struct ndb_ingest_meta *meta);
 #ifndef _WIN32
 // TODO: fix on windows
@@ -735,6 +737,9 @@ void ndb_note_meta_builder_resized(struct ndb_note_meta_builder *builder, unsign
 void ndb_note_meta_counts_set(struct ndb_note_meta_entry *entry, uint32_t total_reactions, uint16_t quotes, uint16_t direct_replies, uint32_t thread_replies, uint16_t reposts);
 void ndb_note_meta_header_init(struct ndb_note_meta *);
 void ndb_note_meta_reaction_set(struct ndb_note_meta_entry *entry, uint32_t count, union ndb_reaction_str str);
+uint32_t *ndb_note_meta_zap_count(struct ndb_note_meta_entry *entry);
+uint64_t *ndb_note_meta_zap_msats(struct ndb_note_meta_entry *entry);
+void ndb_note_meta_zap_set(struct ndb_note_meta_entry *entry, uint32_t count, uint64_t msats);
 void print_note_meta(struct ndb_note_meta *meta);
 
 // META STRINGS
