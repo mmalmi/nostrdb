@@ -790,6 +790,7 @@ void ndb_text_search_config_set_limit(struct ndb_text_search_config *, int limit
 
 // QUERY
 int ndb_query(struct ndb_txn *txn, struct ndb_filter *filters, int num_filters, struct ndb_query_result *results, int result_capacity, int *count);
+int ndb_delete(struct ndb *ndb, struct ndb_filter *filters, int num_filters, int *count);
 
 // NOTE METADATA
 int ndb_note_meta_builder_init(struct ndb_note_meta_builder *builder, unsigned char *, size_t);

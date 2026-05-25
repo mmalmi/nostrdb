@@ -5306,6 +5306,9 @@ struct ndb_word_writer_ctx
 	uint64_t note_id;
 };
 
+static int ndb_fulltext_word_deleter(void *ctx,
+		const char *word, int word_len, int words);
+
 static int ndb_fulltext_word_writer(void *ctx,
 		const char *word, int word_len, int words)
 {
@@ -5347,6 +5350,274 @@ static int ndb_write_note_fulltext_index(struct ndb_txn *txn,
 
 	ndb_parse_words(&cur, &ctx, ndb_fulltext_word_writer);
 
+	return 1;
+}
+
+static int ndb_delete_u64_value_from_db(struct ndb_txn *txn, enum ndb_dbs dbi, uint64_t value)
+{
+	MDB_cursor *cur;
+	MDB_val k, v;
+	int rc, deleted;
+
+	if ((rc = mdb_cursor_open(txn->mdb_txn, txn->lmdb->dbs[dbi], &cur)))
+		return 0;
+
+	deleted = 0;
+	while (mdb_cursor_get(cur, &k, &v, MDB_NEXT) == 0) {
+		if (v.mv_size == sizeof(value) && *((uint64_t*)v.mv_data) == value) {
+			if (mdb_cursor_del(cur, 0) == 0)
+				deleted++;
+		}
+	}
+
+	mdb_cursor_close(cur);
+	return deleted;
+}
+
+static int ndb_delete_profile_for_note(struct ndb_txn *txn, struct ndb_note *note, uint64_t note_key)
+{
+	MDB_cursor *cur;
+	MDB_val k, v, pk, pkv;
+	NdbProfileRecord_table_t record;
+	struct ndb_tsid tsid;
+	uint64_t profile_key;
+	int rc, deleted;
+
+	if ((rc = mdb_cursor_open(txn->mdb_txn, txn->lmdb->dbs[NDB_DB_PROFILE], &cur)))
+		return 0;
+
+	deleted = 0;
+	while (mdb_cursor_get(cur, &k, &v, MDB_NEXT) == 0) {
+		record = NdbProfileRecord_as_root(v.mv_data);
+		if (NdbProfileRecord_note_key(record) != note_key)
+			continue;
+
+		profile_key = *((uint64_t*)k.mv_data);
+		if (mdb_cursor_del(cur, 0) == 0)
+			deleted++;
+
+		ndb_tsid_init(&tsid, note->pubkey, note->created_at);
+		pk.mv_data = &tsid;
+		pk.mv_size = sizeof(tsid);
+		pkv.mv_data = &profile_key;
+		pkv.mv_size = sizeof(profile_key);
+		mdb_del(txn->mdb_txn, txn->lmdb->dbs[NDB_DB_PROFILE_PK], &pk, &pkv);
+		ndb_delete_u64_value_from_db(txn, NDB_DB_PROFILE_SEARCH, profile_key);
+	}
+
+	mdb_cursor_close(cur);
+	return deleted;
+}
+
+static int ndb_delete_note_text_index(struct ndb_txn *txn, struct ndb_note *note, uint64_t note_key)
+{
+	struct cursor cur;
+	unsigned char *content;
+	struct ndb_str str;
+	struct ndb_word_writer_ctx ctx;
+
+	str = ndb_note_str(note, &note->content);
+	if (unlikely(str.flag == NDB_PACKED_ID))
+		return 0;
+
+	content = (unsigned char *)str.str;
+	make_cursor(content, content + note->content_length, &cur);
+
+	ctx.txn = txn;
+	ctx.note = note;
+	ctx.note_id = note_key;
+
+	ndb_parse_words(&cur, &ctx, ndb_fulltext_word_deleter);
+	return 1;
+}
+
+static int ndb_fulltext_word_deleter(void *ctx,
+		const char *word, int word_len, int words)
+{
+	struct ndb_word_writer_ctx *wctx = ctx;
+	unsigned char buffer[1024];
+	int keysize;
+	MDB_val k;
+
+	if (!ndb_make_text_search_key(buffer, sizeof(buffer), words,
+				      word_len, word, wctx->note->created_at,
+				      wctx->note_id, &keysize))
+		return 0;
+
+	k.mv_data = buffer;
+	k.mv_size = keysize;
+	mdb_del(wctx->txn->mdb_txn, wctx->txn->lmdb->dbs[NDB_DB_NOTE_TEXT], &k, NULL);
+	return 1;
+}
+
+static int ndb_delete_note_tag_index(struct ndb_txn *txn, struct ndb_note *note,
+				     uint64_t note_key)
+{
+	unsigned char key_buffer[255];
+	struct ndb_iterator iter;
+	struct ndb_str tkey, tval;
+	char tchar;
+	int len;
+	MDB_val key, val;
+
+	ndb_tags_iterate_start(note, &iter);
+
+	while (ndb_tags_iterate_next(&iter)) {
+		if (iter.tag->count < 2)
+			continue;
+
+		tkey = ndb_tag_str(note, iter.tag, 0);
+		tchar = tkey.str[0];
+		if (tchar == 0 || tkey.str[1] != 0)
+			continue;
+
+		tval = ndb_tag_str(note, iter.tag, 1);
+		len = ndb_str_len(&tval);
+
+		if (!(len = ndb_encode_tag_key(key_buffer, sizeof(key_buffer),
+					       tchar, tval.id, (unsigned char)len,
+					       ndb_note_created_at(note))))
+			continue;
+
+		key.mv_data = key_buffer;
+		key.mv_size = len;
+		val.mv_data = &note_key;
+		val.mv_size = sizeof(note_key);
+		mdb_del(txn->mdb_txn, txn->lmdb->dbs[NDB_DB_NOTE_TAGS], &key, &val);
+	}
+
+	return 1;
+}
+
+static int ndb_delete_note_relay_indexes(struct ndb_txn *txn, struct ndb_note *note, uint64_t note_key)
+{
+	MDB_cursor *cur;
+	MDB_val k, v, rk;
+	struct ndb_relay_kind_key relay_key;
+	unsigned char relay_kind_buf[256];
+	uint64_t key = note_key;
+	int rc, len;
+
+	if ((rc = mdb_cursor_open(txn->mdb_txn, txn->lmdb->dbs[NDB_DB_NOTE_RELAYS], &cur)))
+		return 0;
+
+	k.mv_data = &key;
+	k.mv_size = sizeof(key);
+	if (mdb_cursor_get(cur, &k, &v, MDB_SET) == 0) {
+		do {
+			if (ndb_relay_kind_key_init(&relay_key, note_key, note->kind, note->created_at, (const char*)v.mv_data) &&
+			    (len = ndb_build_relay_kind_key(relay_kind_buf, sizeof(relay_kind_buf), &relay_key))) {
+				rk.mv_data = relay_kind_buf;
+				rk.mv_size = len;
+				mdb_del(txn->mdb_txn, txn->lmdb->dbs[NDB_DB_NOTE_RELAY_KIND], &rk, NULL);
+			}
+		} while (mdb_cursor_get(cur, &k, &v, MDB_NEXT_DUP) == 0);
+	}
+	mdb_cursor_close(cur);
+
+	k.mv_data = &key;
+	k.mv_size = sizeof(key);
+	mdb_del(txn->mdb_txn, txn->lmdb->dbs[NDB_DB_NOTE_RELAYS], &k, NULL);
+	return 1;
+}
+
+static int ndb_delete_note_indexes(struct ndb_txn *txn, struct ndb_note *note, uint64_t note_key)
+{
+	MDB_val key, val;
+	struct ndb_tsid tsid;
+	struct ndb_u64_ts kind_key;
+	struct ndb_id_u64_ts pubkey_kind_key;
+
+	val.mv_data = &note_key;
+	val.mv_size = sizeof(note_key);
+
+	ndb_tsid_init(&tsid, note->id, note->created_at);
+	key.mv_data = &tsid;
+	key.mv_size = sizeof(tsid);
+	mdb_del(txn->mdb_txn, txn->lmdb->dbs[NDB_DB_NOTE_ID], &key, &val);
+
+	ndb_u64_ts_init(&kind_key, note->kind, note->created_at);
+	key.mv_data = &kind_key;
+	key.mv_size = sizeof(kind_key);
+	mdb_del(txn->mdb_txn, txn->lmdb->dbs[NDB_DB_NOTE_KIND], &key, &val);
+
+	ndb_tsid_init(&tsid, note->pubkey, note->created_at);
+	key.mv_data = &tsid;
+	key.mv_size = sizeof(tsid);
+	mdb_del(txn->mdb_txn, txn->lmdb->dbs[NDB_DB_NOTE_PUBKEY], &key, &val);
+
+	ndb_id_u64_ts_init(&pubkey_kind_key, note->pubkey, note->kind, note->created_at);
+	key.mv_data = &pubkey_kind_key;
+	key.mv_size = sizeof(pubkey_kind_key);
+	mdb_del(txn->mdb_txn, txn->lmdb->dbs[NDB_DB_NOTE_PUBKEY_KIND], &key, &val);
+
+	ndb_delete_note_tag_index(txn, note, note_key);
+	ndb_delete_note_text_index(txn, note, note_key);
+	ndb_delete_note_relay_indexes(txn, note, note_key);
+	ndb_delete_profile_for_note(txn, note, note_key);
+
+	key.mv_data = &note_key;
+	key.mv_size = sizeof(note_key);
+	mdb_del(txn->mdb_txn, txn->lmdb->dbs[NDB_DB_NOTE_BLOCKS], &key, NULL);
+
+	key.mv_data = note->id;
+	key.mv_size = 32;
+	mdb_del(txn->mdb_txn, txn->lmdb->dbs[NDB_DB_META], &key, NULL);
+
+	return 1;
+}
+
+int ndb_delete(struct ndb *ndb, struct ndb_filter *filters, int num_filters, int *count)
+{
+	struct ndb_txn txn;
+	MDB_val k;
+	struct ndb_note *note;
+	struct ndb_query_result results[256];
+	uint64_t note_keys[256];
+	size_t note_size;
+	int i, total, returned;
+
+	if (count)
+		*count = 0;
+
+	if (!ndb_begin_rw_query(ndb, &txn))
+		return 0;
+
+	total = 0;
+	do {
+		returned = 0;
+		if (!ndb_query(&txn, filters, num_filters, results,
+			       sizeof(results) / sizeof(results[0]), &returned)) {
+			mdb_txn_abort(txn.mdb_txn);
+			return 0;
+		}
+
+		for (i = 0; i < returned; i++)
+			note_keys[i] = results[i].note_id;
+
+		for (i = 0; i < returned; i++) {
+			note = ndb_get_note_by_key(&txn, note_keys[i], &note_size);
+			if (!note)
+				continue;
+
+			ndb_delete_note_indexes(&txn, note, note_keys[i]);
+			k.mv_data = &note_keys[i];
+			k.mv_size = sizeof(note_keys[i]);
+			if (mdb_del(txn.mdb_txn, txn.lmdb->dbs[NDB_DB_NOTE], &k, NULL) == 0)
+				total++;
+		}
+	} while (returned == (int)(sizeof(results) / sizeof(results[0])));
+
+	if (!ndb_migrate_metadata(&txn)) {
+		mdb_txn_abort(txn.mdb_txn);
+		return 0;
+	}
+
+	if (!ndb_end_query(&txn))
+		return 0;
+
+	if (count)
+		*count = total;
 	return 1;
 }
 
