@@ -17,6 +17,8 @@
 #include <assert.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <stdlib.h>
+#include <string.h>
 
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof(x[0]))
 
@@ -1843,6 +1845,90 @@ static void test_weird_note_corruption() {
 	ndb_destroy(ndb);
 }
 
+static void test_large_note_blocks() {
+	static const size_t content_len = 600 * 1024;
+	const char *prefix =
+		"[\"EVENT\",{\"id\":\"1111111111111111111111111111111111111111111111111111111111111111\","
+		"\"pubkey\":\"2222222222222222222222222222222222222222222222222222222222222222\","
+		"\"created_at\":1722537589,\"kind\":1,\"tags\":[],\"content\":\"";
+	const char *suffix =
+		"\",\"sig\":\"33333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333\"}]";
+	char *content, *ev;
+	size_t prefix_len, suffix_len, ev_len;
+	struct ndb *ndb;
+	struct ndb_config config;
+	struct ndb_blocks *blocks;
+	struct ndb_block *block;
+	struct ndb_str_block *str;
+	struct ndb_block_iterator iterator, *iter = &iterator;
+	struct ndb_filter filter, *f = &filter;
+	uint64_t subid;
+	uint64_t note_id = 0;
+	struct ndb_txn txn;
+	struct ndb_note *note;
+
+	ndb_default_config(&config);
+	ndb_config_set_flags(&config,
+			     NDB_FLAG_SKIP_NOTE_VERIFY |
+			     NDB_FLAG_NO_FULLTEXT |
+			     NDB_FLAG_NO_NOTE_BLOCKS);
+
+	content = malloc(content_len + 1);
+	assert(content);
+	memset(content, 'a', content_len);
+	content[content_len] = '\0';
+
+	prefix_len = strlen(prefix);
+	suffix_len = strlen(suffix);
+	ev_len = prefix_len + content_len + suffix_len;
+	ev = malloc(ev_len + 1);
+	assert(ev);
+	memcpy(ev, prefix, prefix_len);
+	memcpy(ev + prefix_len, content, content_len);
+	memcpy(ev + prefix_len + content_len, suffix, suffix_len + 1);
+
+	delete_test_db();
+	assert(ndb_init(&ndb, test_dir, &config));
+
+	assert(ndb_filter_init(f));
+	assert(ndb_filter_start_field(f, NDB_FILTER_KINDS));
+	assert(ndb_filter_add_int_element(f, 1));
+	ndb_filter_end_field(f);
+	ndb_filter_end(f);
+
+	assert((subid = ndb_subscribe(ndb, f, 1)));
+	assert(ndb_process_event(ndb, ev, ev_len));
+
+	assert(ndb_wait_for_notes(ndb, subid, &note_id, 1) == 1);
+	assert(note_id > 0);
+	assert(ndb_begin_query(ndb, &txn));
+
+	assert((note = ndb_get_note_by_key(&txn, note_id, NULL)));
+	assert(ndb_note_content_length(note) == content_len);
+
+	blocks = ndb_get_blocks_by_key(ndb, &txn, note_id);
+	assert(blocks);
+	assert(blocks->num_blocks == 1);
+	ndb_blocks_iterate_start(ndb_note_content(note), blocks, iter);
+	block = ndb_blocks_iterate_next(iter);
+	assert(block);
+	assert(ndb_get_block_type(block) == BLOCK_TEXT);
+	str = ndb_block_str(block);
+	assert(str->len == (uint32_t)content_len);
+	assert(!ndb_blocks_iterate_next(iter));
+	ndb_blocks_free(blocks);
+
+	ndb_end_query(&txn);
+	assert(ndb_unsubscribe(ndb, subid));
+	ndb_filter_destroy(f);
+	ndb_destroy(ndb);
+	delete_test_db();
+	free(ev);
+	free(content);
+
+	printf("ok test_large_note_blocks\n");
+}
+
 static void test_filter_eq() {
 	struct ndb_filter filter, *f = &filter;
 	struct ndb_filter filter2, *f2 = &filter2;
@@ -2286,6 +2372,7 @@ int main(int argc, const char *argv[]) {
 	test_query();
 	test_tag_query();
 	test_weird_note_corruption();
+	test_large_note_blocks();
 	test_parse_content();
 	test_subscriptions();
 	test_comma_url_parsing();
@@ -2333,6 +2420,3 @@ int main(int argc, const char *argv[]) {
 
 	printf("All tests passed!\n");       // Print this if all tests pass.
 }
-
-
-
